@@ -1,0 +1,32 @@
+# Byte-compiled / cached Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build artifacts (produced by `uv build`)
+build/
+dist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+
+# Virtual environments (uv creates .venv here)
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets / local env
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+.claude/settings.local.json

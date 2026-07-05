@@ -1,0 +1,29 @@
+[project]
+name = "agentling"
+version = "0.0.1"
+description = "A tiny async tool-calling agent framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Folarin Akinloye", email = "me@folarin.dev" }
+]
+keywords = ["agents", "llm", "ai", "tool-calling", "agent-framework", "async"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/folathecoder/agentling"
+Repository = "https://github.com/folathecoder/agentling"
+Issues = "https://github.com/folathecoder/agentling/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
