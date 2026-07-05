@@ -17,7 +17,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = [
+    "openai>=2.44.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/folathecoder/agentling"
