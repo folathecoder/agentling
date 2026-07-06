@@ -1,3 +1,12 @@
+"""Provider-neutral model layer and the OpenAI-compatible adapter.
+
+This module defines the framework's message types (ChatMessage, ToolCall,
+Usage) and streaming types (Delta, ToolCallDelta), the Model protocol that the
+agent loop depends on, and OpenAIModel — an async adapter for any
+OpenAI-compatible chat-completions endpoint, with rate-limit retries,
+streaming, and token-usage capture.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -59,6 +68,7 @@ class Usage:
 
     @property
     def total_tokens(self) -> int:
+        """Total tokens consumed (input + output)."""
         return self.input_tokens + self.output_tokens
 
 
@@ -85,13 +95,17 @@ class Model(Protocol):
         self,
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] | None = None,
-    ) -> ChatMessage: ...
+    ) -> ChatMessage:
+        """Generate one assistant response for the conversation so far."""
+        ...
 
     def stream(
         self,
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] | None = None,
-    ) -> AsyncIterator[Delta]: ...
+    ) -> AsyncIterator[Delta]:
+        """Stream the assistant response as incremental deltas."""
+        ...
 
 
 class OpenAIModel:
