@@ -1,0 +1,47 @@
+name: CI
+
+# Run on every pull request, and on pushes to main (so merges are verified too).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Only need read access to check out the code.
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same ref (e.g. new pushes to an open PR).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Match the versions in pyproject's classifiers (requires-python >=3.11).
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint (ruff)
+        run: uv run --with ruff ruff check src tests
+
+      - name: Type-check (mypy)
+        run: uv run --with mypy mypy src tests
+
+      - name: Test (pytest)
+        run: uv run pytest
