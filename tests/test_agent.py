@@ -189,3 +189,135 @@ async def test_max_steps_forces_a_final_answer() -> None:
 
     assert await agent.run("loop forever") == "forced final"
     assert len(model.calls) == 3  # 2 loop steps + 1 forced tool-free answer
+
+
+def _tool_turn(call_id: str, name: str, **arguments: Any) -> ChatMessage:
+    """A model turn that requests a single tool call."""
+    return _assistant(
+        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Loop detector
+# --------------------------------------------------------------------------- #
+_REPEAT_MARKER = "already made this exact tool call"
+
+
+async def test_loop_detector_nudges_on_repeat() -> None:
+    model = FakeModel(
+        [
+            _tool_turn("c1", "add", a=2, b=3),
+            _tool_turn("c2", "add", a=2, b=3),  # identical (name, args)
+            _assistant(content="done"),
+        ]
+    )
+    agent = Agent(model=model, tools=[add])
+    await agent.run("repeat the same call")
+
+    first, second = agent.memory.steps[1], agent.memory.steps[2]
+    assert isinstance(first, ActionStep)
+    assert isinstance(second, ActionStep)
+    assert _REPEAT_MARKER not in first.tool_results[0].content
+    assert _REPEAT_MARKER in second.tool_results[0].content
+
+
+async def test_loop_detector_ignores_different_args() -> None:
+    model = FakeModel(
+        [
+            _tool_turn("c1", "add", a=2, b=3),
+            _tool_turn("c2", "add", a=4, b=5),  # different args -> not a loop
+            _assistant(content="done"),
+        ]
+    )
+    agent = Agent(model=model, tools=[add])
+    await agent.run("two different sums")
+
+    for step in agent.memory.steps:
+        if isinstance(step, ActionStep):
+            assert _REPEAT_MARKER not in step.tool_results[0].content
+
+
+# --------------------------------------------------------------------------- #
+# Self-heal: unknown tool and always-raising tool
+# --------------------------------------------------------------------------- #
+async def test_unknown_tool_recovers() -> None:
+    model = FakeModel([_tool_turn("c1", "ghost"), _assistant(content="recovered")])
+    agent = Agent(model=model)  # only final_answer is registered
+    answer = await agent.run("call a missing tool")
+
+    assert answer == "recovered"
+    action = agent.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert action.tool_results[0].is_error is True
+    assert "Unknown tool" in action.tool_results[0].content
+
+
+async def test_always_raising_tool_recovers() -> None:
+    @tool
+    def boom() -> str:
+        """Always raises."""
+        raise RuntimeError("nope")
+
+    model = FakeModel(
+        [
+            _tool_turn("c1", "boom"),
+            _tool_turn("c2", "final_answer", answer="handled"),
+        ]
+    )
+    agent = Agent(model=model, tools=[boom])
+    answer = await agent.run("trigger boom")
+
+    assert answer == "handled"
+    action = agent.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert action.tool_results[0].is_error is True
+    assert "RuntimeError" in action.tool_results[0].content
+
+
+# --------------------------------------------------------------------------- #
+# Interruption + resume
+# --------------------------------------------------------------------------- #
+async def test_interrupt_stops_run_gracefully() -> None:
+    model = FakeModel(
+        [_tool_turn("c1", "add", a=1, b=1), _assistant(content="unreached")]
+    )
+    agent = Agent(model=model, tools=[add])
+
+    fired: list[bool] = []
+
+    def interrupt_after_first(step: object) -> None:
+        if not fired:
+            fired.append(True)
+            agent.interrupt()
+
+    agent.step_callbacks.append(interrupt_after_first)
+
+    assert await agent.run("loop") == "Run interrupted."
+    assert isinstance(agent.memory.steps[-1], ActionStep)  # paused before a FinalStep
+    assert len(model.calls) == 1
+
+
+async def test_interrupt_then_resume_completes() -> None:
+    model = FakeModel(
+        [
+            _tool_turn("c1", "add", a=1, b=1),
+            _assistant(content="finished on resume"),
+        ]
+    )
+    agent = Agent(model=model, tools=[add])
+
+    fired: list[bool] = []
+
+    def interrupt_once(step: object) -> None:
+        if not fired:
+            fired.append(True)
+            agent.interrupt()
+
+    agent.step_callbacks.append(interrupt_once)
+
+    assert await agent.run("start") == "Run interrupted."
+    # reset=False keeps the interrupted run's memory; the loop resumes from it.
+    assert await agent.run("continue", reset=False) == "finished on resume"
+    assert len(model.calls) == 2
+    assert sum(isinstance(s, TaskStep) for s in agent.memory.steps) == 2

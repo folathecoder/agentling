@@ -1,11 +1,11 @@
 """Typed step records and the agent's memory.
 
 The agent loop records each turn as a typed Step (TaskStep, ActionStep,
-FinalStep) rather than as raw messages. Steps carry metadata — token usage,
-timing, per-tool results and errors — and know how to render themselves back
-into the ChatMessage list the model sees. Memory holds the steps, renders the
-full conversation via to_messages(), and round-trips to JSON for persistence
-and replay.
+FinalStep) rather than as raw messages. Steps carry metadata such as token
+usage, timing, and per-tool results and errors, and they know how to render
+themselves back into the ChatMessage list the model sees. Memory holds the
+steps, renders the full conversation via to_messages(), and round-trips to JSON
+for persistence and replay.
 """
 
 from __future__ import annotations

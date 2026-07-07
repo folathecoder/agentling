@@ -1,10 +1,9 @@
 """Provider-neutral model layer and the OpenAI-compatible adapter.
 
 This module defines the framework's message types (ChatMessage, ToolCall,
-Usage) and streaming types (Delta, ToolCallDelta), the Model protocol that the
-agent loop depends on, and OpenAIModel — an async adapter for any
-OpenAI-compatible chat-completions endpoint, with rate-limit retries,
-streaming, and token-usage capture.
+Usage) and streaming types (Delta, ToolCallDelta), the Model protocol the agent
+loop depends on, and OpenAIModel: an async adapter for any OpenAI-compatible
+chat-completions endpoint, with retries, streaming, and token-usage capture.
 """
 
 from __future__ import annotations
@@ -190,10 +189,14 @@ class OpenAIModel:
                 yield delta
 
     async def _create_with_retry(self, **kwargs: Any) -> Any:
-        """Call the OpenAI chat-completions API with rate-limit retries.
+        """Call the OpenAI chat-completions API, retrying transient failures.
 
-        Retries cover establishing the request, including opening a stream.
-        A 429 raised mid-stream (after chunks have been yielded) is not retried.
+        Rate limits, connection/timeout errors, and 5xx responses are retried
+        with exponential backoff, then re-raised once max_retries is exhausted.
+        That is the agent's one fatal path. Permanent errors such as a bad
+        request or bad auth are not retried and propagate immediately. Retries
+        cover establishing the request, including opening a stream; a failure
+        that happens mid-stream is not retried.
         """
 
         total_attempts = max(1, self.max_retries + 1)
@@ -202,7 +205,11 @@ class OpenAIModel:
             try:
                 return await self.client.chat.completions.create(**kwargs)
 
-            except openai.RateLimitError:
+            except (
+                openai.RateLimitError,
+                openai.APIConnectionError,  # also covers APITimeoutError
+                openai.InternalServerError,
+            ):
                 if attempt == total_attempts - 1:
                     raise
 
