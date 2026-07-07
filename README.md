@@ -286,6 +286,10 @@ Each entry point is a `"module.path:attribute"` string that must resolve to a
 `Tool` (a function decorated with `@tool`). You can pass skills as folder paths
 (strings or `Path`) or as pre-built `Skill` objects.
 
+> **Security:** a skill's `tools:` entry point is imported, which runs that
+> module's code. Load skills only from sources you trust, exactly as you would a
+> Python import. See [SECURITY.md](SECURITY.md) for the full trust model.
+
 ### Sessions and concurrency
 
 An `Agent` is immutable configuration (model, tools, skills, settings) and is
@@ -571,6 +575,11 @@ instead (useful when tools share state or must not interleave).
 | `max_steps` | `15` | Maximum loop iterations before a forced answer. Must be at least 1. |
 | `step_callbacks` | `()` | Callables invoked with each `ActionStep` as it is recorded. |
 | `parallel_tools` | `True` | Run a turn's tool calls concurrently, or in order when `False`. |
+| `tool_timeout` | `None` | Per-call time budget (seconds) for tools; a timeout becomes a recoverable observation. |
+| `model_timeout` | `None` | Time budget (seconds) for each model turn; exceeding it raises `ModelError`. |
+| `max_tool_output_chars` | `None` | Truncate tool observations head and tail beyond this length. |
+| `redact_errors` | `False` | Hide unexpected tool-exception messages from the model and log them instead. |
+| `context_manager` | `None` | Callable `messages -> messages` applied before each model call, to trim or summarize. |
 
 `OpenAIModel(...)`:
 
@@ -596,11 +605,20 @@ The project uses [uv](https://docs.astral.sh/uv/) for environment and
 dependency management.
 
 ```bash
-uv sync                                   # install everything, including dev deps
-uv run pytest -q                          # run the test suite
-uv run --with ruff ruff check src tests   # lint
-uv run --with mypy mypy src tests         # type-check
+uv sync                                # install everything, including dev deps
+uv run pytest                          # run the test suite
+uv run ruff check src tests            # lint
+uv run ruff format --check src tests   # formatting (run `ruff format` to fix)
+uv run mypy src tests                  # type-check
+uv build                               # verify the package builds
 ```
+
+## Security
+
+Tools and skill-provided tools run as trusted code in your process, and tool
+output is fed back to the model. See [SECURITY.md](SECURITY.md) for the trust
+model, the `redact_errors` and `max_tool_output_chars` knobs, and how to report
+a vulnerability.
 
 ## License
 
