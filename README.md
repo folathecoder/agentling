@@ -130,7 +130,13 @@ asyncio.run(main())
 A tool is any Python function wrapped with `@tool`. The function name becomes
 the tool name, the docstring summary becomes the description, and the type hints
 plus a Google-style `Args:` section become the JSON Schema the model sees. Both
-synchronous and asynchronous functions are supported.
+synchronous and asynchronous functions are supported; a synchronous tool runs in
+a worker thread so it cannot block the event loop.
+
+> **`tool_timeout` caveat:** a timeout stops the agent from *waiting* on a tool
+> and turns it into an observation, but a synchronous tool already running in a
+> thread cannot be forcibly cancelled and will finish in the background. Prefer
+> async tools, or make blocking tools cooperative, when timeouts matter.
 
 ```python
 from agentling import tool
