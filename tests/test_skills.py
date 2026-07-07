@@ -160,7 +160,7 @@ def test_split_returns_mapping_and_body() -> None:
     data, body = _split_frontmatter("---\nname: x\ndescription: y\n---\nHello")
 
     assert data == {"name": "x", "description": "y"}
-    assert body == "\nHello"
+    assert body == "Hello"
 
 
 def test_split_empty_frontmatter_returns_empty_dict() -> None:
@@ -178,6 +178,34 @@ def test_split_unterminated_frontmatter_raises() -> None:
 def test_split_non_mapping_frontmatter_raises() -> None:
     with pytest.raises(ValueError, match="YAML mapping"):
         _split_frontmatter("---\njust a scalar\n---\nbody")
+
+
+def test_split_first_line_must_be_an_exact_fence() -> None:
+    # A leading '---' with text on the same line is not a frontmatter fence.
+    data, body = _split_frontmatter("---not a fence\nname: x\n")
+
+    assert data == {}
+    assert body == "---not a fence\nname: x\n"
+
+
+def test_from_path_rejects_non_list_tools(tmp_path: Path) -> None:
+    folder = _write_skill(
+        tmp_path / "s",
+        "---\nname: s\ndescription: d\ntools: oops\n---\nbody\n",
+    )
+
+    with pytest.raises(ValueError, match="list of strings"):
+        Skill.from_path(folder)
+
+
+def test_from_path_rejects_non_string_tool_entries(tmp_path: Path) -> None:
+    folder = _write_skill(
+        tmp_path / "s",
+        "---\nname: s\ndescription: d\ntools:\n  - 123\n---\nbody\n",
+    )
+
+    with pytest.raises(ValueError, match="list of strings"):
+        Skill.from_path(folder)
 
 
 # --------------------------------------------------------------------------- #

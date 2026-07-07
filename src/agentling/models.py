@@ -422,11 +422,15 @@ def agglomerate_deltas(deltas: Iterable[Delta]) -> ChatMessage:
 
     tool_calls: list[ToolCall] = []
     for _index, fragment in sorted(fragments.items()):
+        # A tool call needs both an id (to match its result message) and a name;
+        # a missing either one is malformed output the loop can retry.
+        if not fragment.id:
+            raise ModelOutputError("Streamed tool call is missing an id.")
         if not fragment.name:
             raise ModelOutputError("Streamed tool call is missing a name.")
         tool_calls.append(
             ToolCall(
-                id=fragment.id or "",
+                id=fragment.id,
                 name=fragment.name,
                 arguments=parse_tool_arguments(fragment.arguments),
             )

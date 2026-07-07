@@ -204,6 +204,12 @@ def test_agglomerate_rejects_tool_call_without_name() -> None:
         agglomerate_deltas(deltas)
 
 
+def test_agglomerate_rejects_tool_call_without_id() -> None:
+    deltas = [Delta(tool_calls=[ToolCallDelta(index=0, name="f", arguments="{}")])]
+    with pytest.raises(ModelOutputError, match="missing an id"):
+        agglomerate_deltas(deltas)
+
+
 # --------------------------------------------------------------------------- #
 # generate (fake client)
 # --------------------------------------------------------------------------- #
