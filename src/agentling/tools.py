@@ -13,6 +13,7 @@ import types
 from collections.abc import Callable
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+from .errors import AgentlingError
 from .models import ToolSpec
 
 # JSON Schema for a tool's parameters object. This is intentionally separate
@@ -20,7 +21,7 @@ from .models import ToolSpec
 JsonSchema = dict[str, Any]
 
 
-class ToolCallError(Exception):
+class ToolCallError(AgentlingError):
     """Raised when a tool receives invalid model-generated arguments.
 
     Agent loops can catch this error and return it to the model as an
