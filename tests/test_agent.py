@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from agentling.agent import Agent, AgentSession
+from agentling.agent import Agent, AgentSession, _truncate_middle
 from agentling.errors import ModelError
 from agentling.events import (
     FinalEvent,
@@ -959,3 +959,30 @@ async def test_print_events_writes_to_file_and_returns_answer() -> None:
     output = buffer.getvalue()
     assert "add" in output  # the tool call was rendered
     assert "5" in output  # the final answer was rendered
+
+
+# --------------------------------------------------------------------------- #
+# Pre-release edge fixes
+# --------------------------------------------------------------------------- #
+def test_load_skill_name_is_reserved_when_skills_are_configured() -> None:
+    @tool
+    def load_skill(name: str) -> str:
+        """A tool that collides with the built-in skill loader.
+
+        Args:
+            name: Unused.
+        """
+        return name
+
+    with pytest.raises(ValueError, match="reserved"):
+        Agent(model=FakeModel([]), tools=[load_skill], skills=[_REVIEWER_SKILL])
+
+
+def test_truncate_middle_handles_tiny_limits() -> None:
+    assert _truncate_middle("abc", 10) == "abc"  # under the limit, unchanged
+    assert _truncate_middle("abcdef", 0) == ""
+    assert _truncate_middle("abcdef", 1) == "a"
+
+    windowed = _truncate_middle("x" * 100, 20)
+    assert "omitted" in windowed
+    assert len(windowed) < 100

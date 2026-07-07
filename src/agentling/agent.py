@@ -132,6 +132,14 @@ class Agent:
         }
         self.instructions = instructions or DEFAULT_INSTRUCTIONS
         if self.skills:
+            # load_skill is the built-in that sessions register to reveal skills.
+            # A caller tool of the same name would silently shadow it, so reserve
+            # the name loudly instead.
+            if "load_skill" in self._base_tools:
+                raise ValueError(
+                    "'load_skill' is a reserved tool name when skills are "
+                    "configured; rename the conflicting tool."
+                )
             self.instructions += _skill_catalog(self.skills.values())
 
     def start(self) -> AgentSession:
@@ -585,6 +593,10 @@ def _truncate_middle(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     keep = limit // 2
+    if keep <= 0:
+        # The limit is too small for a head+tail window (0 or 1), so just cut
+        # the head. text[-0:] would otherwise return the whole string.
+        return text[:limit]
     omitted = len(text) - 2 * keep
     return f"{text[:keep]}\n... [{omitted} characters omitted] ...\n{text[-keep:]}"
 
