@@ -38,10 +38,16 @@ jobs:
         run: uv sync
 
       - name: Lint (ruff)
-        run: uv run --with ruff ruff check src tests
+        run: uv run ruff check src tests
+
+      - name: Format check (ruff)
+        run: uv run ruff format --check src tests
 
       - name: Type-check (mypy)
-        run: uv run --with mypy mypy src tests
+        run: uv run mypy src tests
 
       - name: Test (pytest)
         run: uv run pytest
+
+      - name: Build (verify the package builds)
+        run: uv build

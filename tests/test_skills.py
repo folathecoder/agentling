@@ -97,15 +97,7 @@ def test_from_path_empty_tools_key_yields_no_tools(tmp_path: Path) -> None:
 def test_from_path_preserves_horizontal_rule_in_body(tmp_path: Path) -> None:
     folder = _write_skill(
         tmp_path / "s",
-        "---\n"
-        "name: s\n"
-        "description: d\n"
-        "---\n"
-        "Section one\n"
-        "\n"
-        "---\n"
-        "\n"
-        "Section two\n",
+        "---\nname: s\ndescription: d\n---\nSection one\n\n---\n\nSection two\n",
     )
 
     skill = Skill.from_path(folder)
@@ -222,9 +214,7 @@ def test_resolve_tool_unknown_attribute_raises() -> None:
 # Skill.load_tools
 # --------------------------------------------------------------------------- #
 def test_load_tools_empty_returns_empty_list() -> None:
-    skill = Skill(
-        name="x", description="y", instructions="", path=Path("."), tools=[]
-    )
+    skill = Skill(name="x", description="y", instructions="", path=Path("."), tools=[])
 
     assert skill.load_tools() == []
 
@@ -267,12 +257,7 @@ def test_from_path_then_load_tools_end_to_end(tmp_path: Path) -> None:
 # Bundled example
 # --------------------------------------------------------------------------- #
 def test_bundled_code_reviewer_example_loads() -> None:
-    example = (
-        Path(__file__).parent.parent
-        / "examples"
-        / "skills"
-        / "code-reviewer"
-    )
+    example = Path(__file__).parent.parent / "examples" / "skills" / "code-reviewer"
 
     skill = Skill.from_path(example)
 

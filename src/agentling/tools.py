@@ -105,8 +105,7 @@ class Tool:
         unknown = [name for name in arguments if name not in properties]
         if unknown:
             raise ToolCallError(
-                f"Tool {self.name!r} got unexpected argument(s): "
-                f"{', '.join(unknown)}"
+                f"Tool {self.name!r} got unexpected argument(s): {', '.join(unknown)}"
             )
 
         for name, value in arguments.items():

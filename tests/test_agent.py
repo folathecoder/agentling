@@ -281,9 +281,7 @@ async def test_max_steps_forces_a_final_answer() -> None:
 
 def _tool_turn(call_id: str, name: str, **arguments: Any) -> ChatMessage:
     """A model turn that requests a single tool call."""
-    return _assistant(
-        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)]
-    )
+    return _assistant(tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)])
 
 
 # --------------------------------------------------------------------------- #

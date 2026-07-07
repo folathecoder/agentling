@@ -452,9 +452,7 @@ class AgentSession:
         if response.usage is not None:
             total_usage = total_usage + response.usage
         self.memory.add(FinalStep(answer=response.content))
-        yield FinalEvent(
-            answer=response.content, usage=total_usage, status="max_steps"
-        )
+        yield FinalEvent(answer=response.content, usage=total_usage, status="max_steps")
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Run one tool call, turning any failure into an error observation."""
@@ -465,8 +463,7 @@ class AgentSession:
                 tool_call_id=tool_call.id,
                 name=tool_call.name,
                 content=(
-                    f"Unknown tool {tool_call.name!r}. "
-                    f"Available: {list(self.tools)}"
+                    f"Unknown tool {tool_call.name!r}. Available: {list(self.tools)}"
                 ),
                 is_error=True,
                 error_kind="unknown_tool",
