@@ -1,16 +1,17 @@
 """The agent loop.
 
-Agent assembles the framework's primitives — a Model, a set of Tools, and a
-Memory of typed steps — into an async ReAct loop. A single async generator
-(``_run_stream``) drives everything and yields Events; ``run()`` is a thin
-dispatcher that either hands back that stream (``stream=True``) or drains it and
-returns the final answer (``stream=False``).
+Agent ties the framework's primitives (a Model, some Tools, and a Memory of
+typed steps) into an async ReAct loop. One async generator, _run_stream, does
+the real work and yields Events. run() is a thin dispatcher: it hands back that
+stream when stream is True, or drains it and returns the final answer otherwise.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+import json
+from dataclasses import replace
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
@@ -23,6 +24,11 @@ DEFAULT_INSTRUCTIONS = (
     "You are a helpful agent. Use the available tools to gather information or "
     "take actions, thinking step by step. When you have the answer, call the "
     "final_answer tool (or simply reply with plain text)."
+)
+
+_LOOP_NUDGE = (
+    " Note: you already made this exact tool call and got the same result. "
+    "Try a different approach."
 )
 
 
@@ -48,11 +54,11 @@ class Agent:
         self.max_steps = max_steps
         self.step_callbacks = list(step_callbacks)
         self.parallel_tools = parallel_tools
-        self.skills = list(skills)  # wired in Day 6
+        self.skills = list(skills)  # accepted but not consumed yet
 
         self.memory = Memory()
+        self._interrupt = asyncio.Event()
 
-        # final_answer is always available so the model has an explicit way to stop.
         all_tools = [*tools, FinalAnswerTool()]
         self.tools: dict[str, Tool] = {tool.name: tool for tool in all_tools}
         self._tool_schemas = [tool.to_schema() for tool in all_tools]
@@ -67,10 +73,15 @@ class Agent:
     ) -> Any:
         """Run the agent on a task.
 
-        With stream=False (default) returns a coroutine resolving to the final
-        answer string:  ``answer = await agent.run(task)``.
-        With stream=True returns an async iterator of Events:
-        ``async for event in agent.run(task, stream=True): ...``.
+        With stream=False (the default) this returns a coroutine that resolves
+        to the final answer string:
+
+            answer = await agent.run(task)
+
+        With stream=True it returns an async iterator of Events instead:
+
+            async for event in agent.run(task, stream=True):
+                ...
         """
         events = self._run_stream(task, reset=reset, max_steps=max_steps)
         if stream:
@@ -95,16 +106,33 @@ class Agent:
         self.memory.add(TaskStep(task=task))
 
         limit = max_steps or self.max_steps
+
+        # Remember the previous step's calls so we can spot an exact repeat.
+        previous_signature: tuple[tuple[str, str], ...] | None = None
+
         for _ in range(limit):
+            if self._interrupt.is_set():
+                self._interrupt.clear()
+                yield FinalEvent(answer="Run interrupted.")
+                return
+
             started = time.monotonic()
             messages = self.memory.to_messages(self.instructions)
             response = await self.model.generate(messages, tools=self._tool_schemas)
 
-            # Forgiving termination: a turn with no tool calls IS the final answer.
+            # Forgiving termination: no tool calls means the content is the answer.
             if not response.tool_calls:
                 self.memory.add(FinalStep(answer=response.content))
                 yield FinalEvent(answer=response.content, usage=response.usage)
                 return
+
+            # Fingerprint this step's calls: (name, canonical JSON args) each.
+            signature = tuple(
+                (tc.name, json.dumps(tc.arguments, sort_keys=True))
+                for tc in response.tool_calls
+            )
+            looping = signature == previous_signature
+            previous_signature = signature
 
             # Announce every call, then run them (concurrently or in order).
             for tool_call in response.tool_calls:
@@ -116,6 +144,10 @@ class Agent:
                 )
             else:
                 results = [await self._execute_tool(tc) for tc in response.tool_calls]
+
+            # Same calls as the last step: nudge the model to change approach.
+            if looping:
+                results = [replace(r, content=r.content + _LOOP_NUDGE) for r in results]
 
             for result in results:
                 yield ToolResultEvent(result=result)
@@ -169,8 +201,8 @@ class Agent:
         try:
             output = await tool.call(tool_call.arguments)
         except Exception as exc:
-            # Deliberate broad catch: a failing tool becomes an observation the
-            # model can recover from, never a crash. (Day 5 refines the layers.)
+            # A failing tool becomes an observation the model can recover from
+            # rather than a crash, so catching broadly here is intentional.
             return ToolResult(
                 tool_call_id=tool_call.id,
                 name=tool_call.name,
@@ -183,3 +215,11 @@ class Agent:
             content=str(output),
             is_error=False,
         )
+
+    def interrupt(self) -> None:
+        """Request a graceful stop before the next step.
+
+        The current run pauses rather than crashing; resume it later with
+        run(..., reset=False), which continues from the steps already in memory.
+        """
+        self._interrupt.set()
