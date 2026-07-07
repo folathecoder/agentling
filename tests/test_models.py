@@ -293,7 +293,7 @@ async def test_stream_yields_deltas_then_agglomerates() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# retry-on-429
+# retry policy
 # --------------------------------------------------------------------------- #
 async def test_retry_then_succeeds() -> None:
     calls = 0
