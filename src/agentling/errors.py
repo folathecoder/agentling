@@ -30,9 +30,9 @@ class ModelOutputError(AgentlingError):
     """The model produced output the framework could not parse.
 
     Raised for malformed streamed tool calls (invalid JSON arguments, a
-    non-object arguments payload, or a missing tool name). The agent loop can
-    turn this into a recoverable observation so the model gets a chance to
-    retry.
+    non-object arguments payload, a missing tool name, or a missing tool-call
+    id). The agent loop can turn this into a recoverable observation so the
+    model gets a chance to retry.
     """
 
 

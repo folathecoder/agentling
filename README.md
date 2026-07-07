@@ -1,13 +1,16 @@
 # agentling
 
+[![PyPI](https://img.shields.io/pypi/v/agentling.svg)](https://pypi.org/project/agentling/)
+[![CI](https://github.com/folathecoder/agentling/actions/workflows/ci.yml/badge.svg)](https://github.com/folathecoder/agentling/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Typed](https://img.shields.io/badge/typed-mypy-blue.svg)](https://mypy-lang.org/)
-[![Lint](https://img.shields.io/badge/lint-ruff-orange.svg)](https://docs.astral.sh/ruff/)
 
-A tiny async tool-calling agent framework. The good ideas from larger agent
-libraries (a clean ReAct loop, typed memory, streaming, progressive-disclosure
-skills) in a codebase small enough to read in one sitting.
+A tiny async framework for reliable, observable tool-using agents: a clean
+ReAct loop, typed memory, streaming events, recoverable failures, and
+progressive-disclosure skills, in a codebase small enough to read in one
+sitting.
+
+> **Status: alpha (0.x).** The API may still change before 1.0.
 
 agentling is built around one idea: an agent is a loop that turns a model, some
 tools, and a memory of what happened into more actions, until it has an answer.
@@ -389,7 +392,7 @@ class Model(Protocol):
 
 ## Architecture
 
-agentling is six small modules. Each one owns a single concept, and they depend
+agentling is a small set of focused modules. Each one owns a single concept, and they depend
 on each other in one direction only (agent depends on skills, tools, memory,
 events, models; nothing depends on agent).
 
@@ -399,6 +402,7 @@ events, models; nothing depends on agent).
 | [`tools.py`](src/agentling/tools.py) | The `Tool` abstraction, the `@tool` decorator, JSON Schema generation from function signatures, argument validation, and the built-in `final_answer` tool. |
 | [`memory.py`](src/agentling/memory.py) | Typed steps (`TaskStep`, `ActionStep`, `FinalStep`), the `Memory` container, rendering to model messages, and JSON serialization. |
 | [`events.py`](src/agentling/events.py) | The streaming event types, the `Event` union, and the `print_events` renderer. |
+| [`errors.py`](src/agentling/errors.py) | The exception hierarchy: `AgentlingError` and its domain subclasses. |
 | [`skills.py`](src/agentling/skills.py) | The `Skill` dataclass, the `SKILL.md` loader (frontmatter plus body), and entry-point tool resolution. |
 | [`agent.py`](src/agentling/agent.py) | The `Agent` config/factory, the `AgentSession` that holds one run's state, and the ReAct loop that ties everything together. |
 
@@ -543,9 +547,11 @@ the run. Explicit `final_answer` and plain-text replies both work.
 #### Self-healing tool errors
 
 `_execute_tool` catches any exception a tool raises and turns it into a
-`ToolResult` with `is_error=True`. That error is rendered back to the model as an
-observation ("Error from 'search': ... Fix the arguments and try again"), so the
-model can correct course. One bad tool call does not kill the run.
+`ToolResult` with `is_error=True`, tagged by kind. The observation the model
+sees carries a hint that depends on the failure: an invalid-argument error says
+"Fix the arguments and try again", while an execution, timeout, or unknown-tool
+error says "Consider a different approach or tool". So the model can correct
+course, and one bad tool call does not kill the run.
 
 #### Loop detection
 
@@ -618,6 +624,20 @@ uv run ruff format --check src tests   # formatting (run `ruff format` to fix)
 uv run mypy src tests                  # type-check
 uv build                               # verify the package builds
 ```
+
+## Limitations
+
+agentling is deliberately small, so some things are out of scope for now:
+
+- **Schema validation is shallow.** Tool arguments are checked against a
+  practical subset of JSON Schema (primitives, `list`/`dict`, `Optional`,
+  `Literal`), not the full spec.
+- **No built-in tracing backend.** `step_callbacks` and the event stream are the
+  hooks; wiring them to a tracer or metrics store is up to you.
+- **No sandboxing.** Tools and skill-provided tools run as trusted code (see
+  [Security](#security)).
+- **No automatic context summarization.** Long runs can outgrow the context
+  window; supply a `context_manager` to trim or summarize.
 
 ## Security
 

@@ -331,7 +331,7 @@ class AgentSession:
                 )
                 return
 
-            # Malformed tool calls (bad JSON, missing name) are recoverable:
+            # Malformed tool calls (bad JSON, missing id or name) are recoverable:
             # re-prompt the model with a correction, up to a small cap, rather
             # than crashing the run.
             try:

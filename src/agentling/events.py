@@ -8,8 +8,9 @@ StepEvent connects the live event stream to memory by carrying the step that
 was just recorded.
 
 Ordering within a run is deterministic: a turn's TextDelta chunks arrive in
-order, then a ToolCallEvent and its matching ToolResultEvent for each tool call,
-then the StepEvent for that step. Exactly one FinalEvent is emitted, last.
+order, then every ToolCallEvent for the step, then every ToolResultEvent in the
+same call order, then the StepEvent for that step. Exactly one FinalEvent is
+emitted, last.
 """
 
 from __future__ import annotations
