@@ -55,12 +55,22 @@ class Skill:
                 f"{folder / SKILL_FILE} is missing required frontmatter key {exc}."
             ) from exc
 
+        raw_tools = frontmatter.get("tools", [])
+        if raw_tools is None:
+            raw_tools = []
+        if not isinstance(raw_tools, list) or not all(
+            isinstance(item, str) for item in raw_tools
+        ):
+            raise ValueError(
+                f"{folder / SKILL_FILE}: 'tools' must be a list of strings."
+            )
+
         return cls(
             name=name,
             description=description,
             instructions=body.strip(),
             path=folder,
-            tools=list(frontmatter.get("tools") or []),
+            tools=raw_tools,
         )
 
     def load_tools(self) -> list[Tool]:
@@ -72,25 +82,25 @@ class Skill:
 def _split_frontmatter(source: str) -> tuple[dict[str, Any], str]:
     """Split a SKILL.md into its YAML frontmatter dict and markdown body.
 
-    The frontmatter is the block between the leading '---' fence and the next
-    '---' line. A file with no leading fence is treated as all body.
+    Frontmatter is delimited by two fence lines, each exactly '---' on its own.
+    A file whose first line is not exactly '---' is treated as all body, so a
+    '---' horizontal rule inside the body is never mistaken for a fence.
     """
 
-    if not source.startswith("---"):
+    lines = source.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
         return {}, source
 
-    # maxsplit=2 splits on only the first two fences, so a '---' horizontal
-    # rule inside the body is left intact. parts[0] is empty because the
-    # string starts with the opening fence.
-    parts = source.split("---", 2)
-    if len(parts) < 3:
-        raise ValueError("Unterminated SKILL.md frontmatter (missing closing '---').")
+    # The body starts after the first closing fence, so a later '---' in the
+    # body is left untouched.
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            data = yaml.safe_load("".join(lines[1:index])) or {}
+            if not isinstance(data, dict):
+                raise ValueError("SKILL.md frontmatter must be a YAML mapping.")
+            return data, "".join(lines[index + 1 :])
 
-    data = yaml.safe_load(parts[1]) or {}
-    if not isinstance(data, dict):
-        raise ValueError("SKILL.md frontmatter must be a YAML mapping.")
-
-    return data, parts[2]
+    raise ValueError("Unterminated SKILL.md frontmatter (missing closing '---').")
 
 
 def _resolve_tool(spec: str) -> Tool:

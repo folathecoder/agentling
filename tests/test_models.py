@@ -5,6 +5,7 @@ from typing import Any, cast
 import openai
 import pytest
 
+from agentling.errors import ModelOutputError
 from agentling.models import (
     ChatMessage,
     Delta,
@@ -134,12 +135,12 @@ def test_parse_tool_arguments_empty_defaults_to_object(model: OpenAIModel) -> No
 
 
 def test_parse_tool_arguments_invalid_json_raises(model: OpenAIModel) -> None:
-    with pytest.raises(ValueError, match="Invalid tool call arguments"):
+    with pytest.raises(ModelOutputError, match="Invalid tool call arguments"):
         model._parse_tool_arguments("{not json}")
 
 
 def test_parse_tool_arguments_non_object_raises(model: OpenAIModel) -> None:
-    with pytest.raises(ValueError, match="must be a JSON object"):
+    with pytest.raises(ModelOutputError, match="must be a JSON object"):
         model._parse_tool_arguments("[1, 2]")
 
 
@@ -155,13 +156,13 @@ def test_agglomerate_concatenates_content() -> None:
 
 def test_agglomerate_merges_tool_call_fragments() -> None:
     deltas = [
-        Delta(tool_calls=[ToolCallDelta(index=0, id="c1", name="wx", arguments='{"ci')]),
+        Delta(
+            tool_calls=[ToolCallDelta(index=0, id="c1", name="wx", arguments='{"ci')]
+        ),
         Delta(tool_calls=[ToolCallDelta(index=0, arguments='ty": "Paris"}')]),
     ]
     msg = agglomerate_deltas(deltas)
-    assert msg.tool_calls == [
-        ToolCall(id="c1", name="wx", arguments={"city": "Paris"})
-    ]
+    assert msg.tool_calls == [ToolCall(id="c1", name="wx", arguments={"city": "Paris"})]
 
 
 def test_agglomerate_groups_parallel_calls_by_index() -> None:
@@ -177,6 +178,36 @@ def test_agglomerate_groups_parallel_calls_by_index() -> None:
 def test_agglomerate_captures_usage() -> None:
     msg = agglomerate_deltas([Delta(content="x"), Delta(usage=Usage(5, 2))])
     assert msg.usage == Usage(5, 2)
+
+
+def test_agglomerate_rejects_invalid_tool_json() -> None:
+    deltas = [
+        Delta(tool_calls=[ToolCallDelta(index=0, id="c1", name="f", arguments="{bad")])
+    ]
+    with pytest.raises(ModelOutputError, match="Invalid tool call arguments"):
+        agglomerate_deltas(deltas)
+
+
+def test_agglomerate_rejects_non_object_tool_args() -> None:
+    deltas = [
+        Delta(
+            tool_calls=[ToolCallDelta(index=0, id="c1", name="f", arguments="[1, 2]")]
+        )
+    ]
+    with pytest.raises(ModelOutputError, match="must be a JSON object"):
+        agglomerate_deltas(deltas)
+
+
+def test_agglomerate_rejects_tool_call_without_name() -> None:
+    deltas = [Delta(tool_calls=[ToolCallDelta(index=0, id="c1", arguments="{}")])]
+    with pytest.raises(ModelOutputError, match="missing a name"):
+        agglomerate_deltas(deltas)
+
+
+def test_agglomerate_rejects_tool_call_without_id() -> None:
+    deltas = [Delta(tool_calls=[ToolCallDelta(index=0, name="f", arguments="{}")])]
+    with pytest.raises(ModelOutputError, match="missing an id"):
+        agglomerate_deltas(deltas)
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +239,9 @@ async def test_generate_parses_tool_calls_and_coerces_content() -> None:
             function=SimpleNamespace(name="get_weather", arguments='{"city": "Paris"}'),
         )
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tc]))],
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tc]))
+            ],
             usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
         )
 
@@ -227,11 +260,15 @@ async def test_generate_parses_tool_calls_and_coerces_content() -> None:
 async def test_stream_yields_deltas_then_agglomerates() -> None:
     chunks = [
         SimpleNamespace(
-            choices=[SimpleNamespace(delta=SimpleNamespace(content="Hel", tool_calls=None))],
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content="Hel", tool_calls=None))
+            ],
             usage=None,
         ),
         SimpleNamespace(
-            choices=[SimpleNamespace(delta=SimpleNamespace(content="lo", tool_calls=None))],
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content="lo", tool_calls=None))
+            ],
             usage=None,
         ),
         SimpleNamespace(  # final usage-only chunk
@@ -256,12 +293,14 @@ async def test_stream_yields_deltas_then_agglomerates() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# retry-on-429
+# retry policy
 # --------------------------------------------------------------------------- #
 async def test_retry_then_succeeds() -> None:
     calls = 0
     result = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None))],
+        choices=[
+            SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None))
+        ],
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
     )
 

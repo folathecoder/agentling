@@ -16,6 +16,8 @@ from typing import Any, Literal, Protocol, cast
 
 import openai
 
+from .errors import ModelOutputError
+
 Role = Literal["system", "user", "assistant", "tool"]
 ToolSpec = dict[str, Any]
 OpenAIMessage = dict[str, Any]
@@ -69,6 +71,13 @@ class Usage:
     def total_tokens(self) -> int:
         """Total tokens consumed (input + output)."""
         return self.input_tokens + self.output_tokens
+
+    def __add__(self, other: Usage) -> Usage:
+        """Sum two usages field-wise (used to accumulate a run's total)."""
+        return Usage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+        )
 
 
 @dataclass
@@ -345,22 +354,11 @@ class OpenAIModel:
     def _parse_tool_arguments(self, arguments: str) -> dict[str, Any]:
         """Parse and validate model-generated tool arguments.
 
-        Tool-call arguments should be a JSON object. If the model emits invalid
-        JSON or a non-object value, fail loudly so the caller can decide how to
-        handle the error.
+        Thin wrapper over the module-level parse_tool_arguments so the streaming
+        and non-streaming paths validate identically.
         """
 
-        try:
-            parsed = json.loads(arguments or "{}")
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid tool call arguments: {arguments!r}") from exc
-
-        if not isinstance(parsed, dict):
-            raise ValueError(
-                f"Tool call arguments must be a JSON object: {arguments!r}"
-            )
-
-        return parsed
+        return parse_tool_arguments(arguments)
 
 
 @dataclass
@@ -370,6 +368,28 @@ class _ToolCallFragment:
     id: str | None = None
     name: str | None = None
     arguments: str = ""
+
+
+def parse_tool_arguments(arguments: str) -> dict[str, Any]:
+    """Parse and validate model-generated tool arguments.
+
+    Tool-call arguments must be a JSON object. Invalid JSON or a non-object
+    value is malformed model output, so this raises ModelOutputError; the agent
+    loop can turn that into a recoverable observation. Both the streaming and
+    non-streaming paths route through here so they validate identically.
+    """
+
+    try:
+        parsed = json.loads(arguments or "{}")
+    except json.JSONDecodeError as exc:
+        raise ModelOutputError(f"Invalid tool call arguments: {arguments!r}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ModelOutputError(
+            f"Tool call arguments must be a JSON object: {arguments!r}"
+        )
+
+    return parsed
 
 
 def agglomerate_deltas(deltas: Iterable[Delta]) -> ChatMessage:
@@ -400,14 +420,21 @@ def agglomerate_deltas(deltas: Iterable[Delta]) -> ChatMessage:
         if delta.usage is not None:
             usage = delta.usage
 
-    tool_calls = [
-        ToolCall(
-            id=fragment.id or "",
-            name=fragment.name or "",
-            arguments=json.loads(fragment.arguments or "{}"),
+    tool_calls: list[ToolCall] = []
+    for _index, fragment in sorted(fragments.items()):
+        # A tool call needs both an id (to match its result message) and a name;
+        # a missing either one is malformed output the loop can retry.
+        if not fragment.id:
+            raise ModelOutputError("Streamed tool call is missing an id.")
+        if not fragment.name:
+            raise ModelOutputError("Streamed tool call is missing a name.")
+        tool_calls.append(
+            ToolCall(
+                id=fragment.id,
+                name=fragment.name,
+                arguments=parse_tool_arguments(fragment.arguments),
+            )
         )
-        for _index, fragment in sorted(fragments.items())
-    ]
 
     return ChatMessage(
         role="assistant",

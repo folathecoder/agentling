@@ -14,7 +14,11 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar
 
+from .errors import MemoryLoadError
 from .models import ChatMessage, ToolCall, Usage
+
+# Serialization format version written by to_dict and checked by from_dict.
+_MEMORY_VERSION = 1
 
 
 @dataclass
@@ -25,6 +29,10 @@ class ToolResult:
     name: str
     content: str
     is_error: bool = False
+    # For failures, the kind of failure: "validation" (bad arguments),
+    # "execution" (the tool raised), "timeout", or "unknown_tool". None on
+    # success. Drives the recovery hint shown to the model.
+    error_kind: str | None = None
 
 
 @dataclass
@@ -62,13 +70,14 @@ class ActionStep:
         for result in self.tool_results:
             content = result.content
             # Failed tool calls are returned to the model as observations so the
-            # next turn can recover. The tool name is included because a single
-            # step may contain several calls.
+            # next turn can recover. Only a validation error is fixed by changing
+            # the arguments; other failures need a different approach.
             if result.is_error:
-                content = (
-                    f"Error from {result.name!r}: {result.content}. "
-                    "Fix the arguments and try again."
-                )
+                if result.error_kind == "validation":
+                    hint = "Fix the arguments and try again."
+                else:
+                    hint = "Consider a different approach or tool."
+                content = f"Error from {result.name!r}: {result.content}. {hint}"
             messages.append(
                 ChatMessage(
                     role="tool", content=content, tool_call_id=result.tool_call_id
@@ -142,7 +151,7 @@ class Memory:
         # the load path restores from each step's "type" tag. The version field
         # lets the format evolve without breaking older saved runs.
         return {
-            "version": 1,
+            "version": _MEMORY_VERSION,
             "steps": [
                 {"type": self._KIND[type(step)], "data": asdict(step)}
                 for step in self.steps
@@ -151,9 +160,32 @@ class Memory:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Memory:
-        """Rebuild a Memory from the dict produced by to_dict()."""
+        """Rebuild a Memory from the dict produced by to_dict().
 
-        return cls(steps=[_step_from_dict(entry) for entry in data.get("steps", [])])
+        Validates the version and overall shape, raising MemoryLoadError with a
+        clear message rather than letting a malformed payload fail with a raw
+        KeyError deep in reconstruction.
+        """
+
+        if not isinstance(data, dict):
+            raise MemoryLoadError("Serialized memory must be a JSON object.")
+
+        version = data.get("version")
+        if version != _MEMORY_VERSION:
+            raise MemoryLoadError(
+                f"Unsupported memory version {version!r} (expected {_MEMORY_VERSION})."
+            )
+
+        entries = data.get("steps", [])
+        if not isinstance(entries, list):
+            raise MemoryLoadError("Memory 'steps' must be a list.")
+
+        try:
+            steps = [_step_from_dict(entry) for entry in entries]
+        except (KeyError, TypeError) as exc:
+            raise MemoryLoadError(f"Malformed memory step: {exc}") from exc
+
+        return cls(steps=steps)
 
     def dump_json(self) -> str:
         """Serialize the memory to a JSON string."""
@@ -199,4 +231,4 @@ def _step_from_dict(entry: dict[str, Any]) -> Step:
             duration=data["duration"],
         )
 
-    raise ValueError(f"Unknown step type: {kind!r}")
+    raise MemoryLoadError(f"Unknown step type: {kind!r}")

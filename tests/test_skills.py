@@ -97,15 +97,7 @@ def test_from_path_empty_tools_key_yields_no_tools(tmp_path: Path) -> None:
 def test_from_path_preserves_horizontal_rule_in_body(tmp_path: Path) -> None:
     folder = _write_skill(
         tmp_path / "s",
-        "---\n"
-        "name: s\n"
-        "description: d\n"
-        "---\n"
-        "Section one\n"
-        "\n"
-        "---\n"
-        "\n"
-        "Section two\n",
+        "---\nname: s\ndescription: d\n---\nSection one\n\n---\n\nSection two\n",
     )
 
     skill = Skill.from_path(folder)
@@ -168,7 +160,7 @@ def test_split_returns_mapping_and_body() -> None:
     data, body = _split_frontmatter("---\nname: x\ndescription: y\n---\nHello")
 
     assert data == {"name": "x", "description": "y"}
-    assert body == "\nHello"
+    assert body == "Hello"
 
 
 def test_split_empty_frontmatter_returns_empty_dict() -> None:
@@ -186,6 +178,34 @@ def test_split_unterminated_frontmatter_raises() -> None:
 def test_split_non_mapping_frontmatter_raises() -> None:
     with pytest.raises(ValueError, match="YAML mapping"):
         _split_frontmatter("---\njust a scalar\n---\nbody")
+
+
+def test_split_first_line_must_be_an_exact_fence() -> None:
+    # A leading '---' with text on the same line is not a frontmatter fence.
+    data, body = _split_frontmatter("---not a fence\nname: x\n")
+
+    assert data == {}
+    assert body == "---not a fence\nname: x\n"
+
+
+def test_from_path_rejects_non_list_tools(tmp_path: Path) -> None:
+    folder = _write_skill(
+        tmp_path / "s",
+        "---\nname: s\ndescription: d\ntools: oops\n---\nbody\n",
+    )
+
+    with pytest.raises(ValueError, match="list of strings"):
+        Skill.from_path(folder)
+
+
+def test_from_path_rejects_non_string_tool_entries(tmp_path: Path) -> None:
+    folder = _write_skill(
+        tmp_path / "s",
+        "---\nname: s\ndescription: d\ntools:\n  - 123\n---\nbody\n",
+    )
+
+    with pytest.raises(ValueError, match="list of strings"):
+        Skill.from_path(folder)
 
 
 # --------------------------------------------------------------------------- #
@@ -222,9 +242,7 @@ def test_resolve_tool_unknown_attribute_raises() -> None:
 # Skill.load_tools
 # --------------------------------------------------------------------------- #
 def test_load_tools_empty_returns_empty_list() -> None:
-    skill = Skill(
-        name="x", description="y", instructions="", path=Path("."), tools=[]
-    )
+    skill = Skill(name="x", description="y", instructions="", path=Path("."), tools=[])
 
     assert skill.load_tools() == []
 
@@ -267,12 +285,7 @@ def test_from_path_then_load_tools_end_to_end(tmp_path: Path) -> None:
 # Bundled example
 # --------------------------------------------------------------------------- #
 def test_bundled_code_reviewer_example_loads() -> None:
-    example = (
-        Path(__file__).parent.parent
-        / "examples"
-        / "skills"
-        / "code-reviewer"
-    )
+    example = Path(__file__).parent.parent / "examples" / "skills" / "code-reviewer"
 
     skill = Skill.from_path(example)
 

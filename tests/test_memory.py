@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from agentling.errors import MemoryLoadError
 from agentling.memory import (
     ActionStep,
     FinalStep,
@@ -54,11 +55,35 @@ def test_action_step_renders_error_observation() -> None:
             tool_calls=[ToolCall(id="c1", name="f", arguments={})],
         ),
         tool_results=[
-            ToolResult(tool_call_id="c1", name="f", content="boom", is_error=True)
+            ToolResult(
+                tool_call_id="c1",
+                name="f",
+                content="boom",
+                is_error=True,
+                error_kind="validation",
+            )
         ],
     )
     tool_msg = step.to_messages()[1]
     assert tool_msg.content == "Error from 'f': boom. Fix the arguments and try again."
+
+
+def test_action_step_execution_error_uses_a_different_hint() -> None:
+    step = ActionStep(
+        model_message=ChatMessage(role="assistant"),
+        tool_results=[
+            ToolResult(
+                tool_call_id="c1",
+                name="f",
+                content="network down",
+                is_error=True,
+                error_kind="execution",
+            )
+        ],
+    )
+    tool_msg = step.to_messages()[1]
+    assert "different approach" in tool_msg.content
+    assert "Fix the arguments" not in tool_msg.content
 
 
 def test_final_step_renders_assistant_message() -> None:
@@ -148,5 +173,15 @@ def test_round_trip_preserves_error_flag() -> None:
 
 
 def test_from_dict_rejects_unknown_step_type() -> None:
-    with pytest.raises(ValueError, match="Unknown step type"):
-        Memory.from_dict({"steps": [{"type": "bogus", "data": {}}]})
+    with pytest.raises(MemoryLoadError, match="Unknown step type"):
+        Memory.from_dict({"version": 1, "steps": [{"type": "bogus", "data": {}}]})
+
+
+def test_from_dict_rejects_unsupported_version() -> None:
+    with pytest.raises(MemoryLoadError, match="version"):
+        Memory.from_dict({"version": 999, "steps": []})
+
+
+def test_from_dict_rejects_non_list_steps() -> None:
+    with pytest.raises(MemoryLoadError, match="steps"):
+        Memory.from_dict({"version": 1, "steps": "not a list"})
