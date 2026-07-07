@@ -291,7 +291,9 @@ class AgentSession:
         for _ in range(limit):
             if self._interrupt.is_set():
                 self._interrupt.clear()
-                yield FinalEvent(answer="Run interrupted.", usage=total_usage)
+                yield FinalEvent(
+                    answer="Run interrupted.", usage=total_usage, status="interrupted"
+                )
                 return
 
             started = time.monotonic()
@@ -324,7 +326,9 @@ class AgentSession:
 
             if interrupted:
                 self._interrupt.clear()
-                yield FinalEvent(answer="Run interrupted.", usage=total_usage)
+                yield FinalEvent(
+                    answer="Run interrupted.", usage=total_usage, status="interrupted"
+                )
                 return
 
             # Malformed tool calls (bad JSON, missing name) are recoverable:
@@ -448,7 +452,9 @@ class AgentSession:
         if response.usage is not None:
             total_usage = total_usage + response.usage
         self.memory.add(FinalStep(answer=response.content))
-        yield FinalEvent(answer=response.content, usage=total_usage)
+        yield FinalEvent(
+            answer=response.content, usage=total_usage, status="max_steps"
+        )
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Run one tool call, turning any failure into an error observation."""

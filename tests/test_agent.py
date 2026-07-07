@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import threading
 from collections.abc import AsyncIterator, Sequence
@@ -15,6 +16,7 @@ from agentling.events import (
     TextDelta,
     ToolCallEvent,
     ToolResultEvent,
+    print_events,
 )
 from agentling.memory import ActionStep, FinalStep, TaskStep
 from agentling.models import ChatMessage, Delta, ToolCall, ToolCallDelta, Usage
@@ -901,3 +903,61 @@ async def test_context_manager_trims_the_prompt() -> None:
     assert await agent.run("hello") == "ok"
     # The model saw only the trimmed message list.
     assert len(model.calls[0]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Terminal run status and print_events
+# --------------------------------------------------------------------------- #
+async def test_completed_run_reports_status() -> None:
+    model = FakeModel([_assistant(content="done")])
+    agent = Agent(model=model)
+
+    events = [event async for event in agent.run("go", stream=True)]
+    final = events[-1]
+    assert isinstance(final, FinalEvent)
+    assert final.status == "completed"
+
+
+async def test_interrupted_run_reports_status() -> None:
+    model = FakeModel([_tool_turn("c1", "add", a=1, b=1), _assistant(content="x")])
+    agent = Agent(model=model, tools=[add])
+    session = agent.start()
+
+    fired: list[bool] = []
+
+    def stop(step: object) -> None:
+        if not fired:
+            fired.append(True)
+            session.interrupt()
+
+    session.step_callbacks.append(stop)
+
+    events = [event async for event in session.run("loop", stream=True)]
+    final = events[-1]
+    assert isinstance(final, FinalEvent)
+    assert final.status == "interrupted"
+
+
+async def test_max_steps_run_reports_status() -> None:
+    looping = [_tool_turn(f"c{i}", "add", a=1, b=1) for i in range(2)]
+    model = FakeModel([*looping, _assistant(content="forced")])
+    agent = Agent(model=model, tools=[add], max_steps=2)
+
+    events = [event async for event in agent.run("loop", stream=True)]
+    final = events[-1]
+    assert isinstance(final, FinalEvent)
+    assert final.answer == "forced"
+    assert final.status == "max_steps"
+
+
+async def test_print_events_writes_to_file_and_returns_answer() -> None:
+    model = FakeModel([_tool_turn("c1", "add", a=2, b=3), _assistant(content="5")])
+    agent = Agent(model=model, tools=[add])
+
+    buffer = io.StringIO()
+    answer = await print_events(agent.run("add", stream=True), file=buffer)
+
+    assert answer == "5"
+    output = buffer.getvalue()
+    assert "add" in output  # the tool call was rendered
+    assert "5" in output  # the final answer was rendered

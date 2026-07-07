@@ -6,6 +6,10 @@ inspect tool execution, and react to completion in real time.
 
 StepEvent connects the live event stream to memory by carrying the step that
 was just recorded.
+
+Ordering within a run is deterministic: a turn's TextDelta chunks arrive in
+order, then a ToolCallEvent and its matching ToolResultEvent for each tool call,
+then the StepEvent for that step. Exactly one FinalEvent is emitted, last.
 """
 
 from __future__ import annotations
@@ -13,9 +17,12 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import IO, Literal
 
 from .memory import Step, ToolResult
 from .models import ToolCall, Usage
+
+RunStatus = Literal["completed", "interrupted", "max_steps"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,10 +55,16 @@ class StepEvent:
 
 @dataclass(frozen=True, slots=True)
 class FinalEvent:
-    """Emitted once when the run completes, carrying the answer and total usage."""
+    """Emitted once when the run ends, carrying the answer, usage, and status.
+
+    status is how the run ended: "completed" (the model finished), "interrupted"
+    (a caller interrupted it), or "max_steps" (the step limit was hit and a final
+    answer was forced). Failures the run cannot recover from raise instead.
+    """
 
     answer: str
     usage: Usage | None = None
+    status: RunStatus = "completed"
 
 
 # Public union type for the values yielded by the agent's event stream.
@@ -64,13 +77,16 @@ def _truncate(text: str, limit: int = 500) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-async def print_events(events: AsyncIterator[Event]) -> str:
-    """Render an agent's event stream to stdout as it arrives.
+async def print_events(
+    events: AsyncIterator[Event], *, file: IO[str] | None = None
+) -> str:
+    """Render an agent's event stream as it arrives.
 
     Consumes the iterator from Agent.run(..., stream=True): assistant text
     prints token by token, each tool call and its result get their own line,
     and the final answer is shown at the end. Returns that answer so the caller
-    can keep using it once the run has been displayed.
+    can keep using it once the run has been displayed. Output goes to file, or
+    to stdout when file is None.
     """
 
     answer = ""
@@ -79,22 +95,22 @@ async def print_events(events: AsyncIterator[Event]) -> str:
     async for event in events:
         match event:
             case TextDelta(text=text):
-                print(text, end="", flush=True)
+                print(text, end="", flush=True, file=file)
                 mid_line = True
             case ToolCallEvent(tool_call=call):
                 if mid_line:
-                    print()
+                    print(file=file)
                     mid_line = False
-                print(f"-> {call.name}({json.dumps(call.arguments)})")
+                print(f"-> {call.name}({json.dumps(call.arguments)})", file=file)
             case ToolResultEvent(result=result):
                 status = "error" if result.is_error else "ok"
-                print(f"<- [{status}] {_truncate(result.content)}")
+                print(f"<- [{status}] {_truncate(result.content)}", file=file)
             case FinalEvent(answer=final):
                 if mid_line:
-                    print()
+                    print(file=file)
                     mid_line = False
                 answer = final
-                print(f"= {final}")
+                print(f"= {final}", file=file)
             case StepEvent():
                 pass  # Its contents already surfaced through the events above.
 
