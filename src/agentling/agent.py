@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import replace
@@ -56,6 +57,8 @@ _LOOP_NUDGE = (
 # How many consecutive unparseable model turns to tolerate before giving up.
 _MAX_MALFORMED_RETRIES = 2
 
+logger = logging.getLogger("agentling")
+
 
 class Agent:
     """Immutable configuration and a factory for sessions.
@@ -77,6 +80,8 @@ class Agent:
         parallel_tools: bool = True,
         tool_timeout: float | None = None,
         model_timeout: float | None = None,
+        max_tool_output_chars: int | None = None,
+        redact_errors: bool = False,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1.")
@@ -86,6 +91,8 @@ class Agent:
         self.parallel_tools = parallel_tools
         self.tool_timeout = tool_timeout
         self.model_timeout = model_timeout
+        self.max_tool_output_chars = max_tool_output_chars
+        self.redact_errors = redact_errors
         # Default callbacks applied to every session. A session copies these and
         # may append its own.
         self.step_callbacks = list(step_callbacks)
@@ -350,7 +357,14 @@ class AgentSession:
             for tool_call in response.tool_calls:
                 yield ToolCallEvent(tool_call=tool_call)
 
-            if self.agent.parallel_tools:
+            # Run this step's tools concurrently only when the agent allows it
+            # and every tool in the step is parallel_safe; otherwise run them in
+            # order so a side-effectful tool cannot interleave with others.
+            step_tools = [self.tools.get(tc.name) for tc in response.tool_calls]
+            run_parallel = self.agent.parallel_tools and all(
+                t is None or t.parallel_safe for t in step_tools
+            )
+            if run_parallel:
                 results: list[ToolResult] = await asyncio.gather(
                     *(self._execute_tool(tc) for tc in response.tool_calls)
                 )
@@ -450,19 +464,46 @@ class AgentSession:
                 content=f"{type(err).__name__}: {err}",
                 is_error=True,
             )
-        except Exception as exc:
-            # A failing tool becomes an observation the model can recover from
-            # rather than a crash, so catching broadly here is intentional.
+        except ToolCallError as exc:
+            # Invalid-argument errors are safe and useful, so the model always
+            # sees them in full to correct its call.
             return ToolResult(
                 tool_call_id=tool_call.id,
                 name=tool_call.name,
                 content=f"{type(exc).__name__}: {exc}",
                 is_error=True,
             )
+        except Exception as exc:
+            # An unexpected tool failure becomes an observation the model can
+            # recover from. With redact_errors the message (which may carry
+            # secrets or internal detail) is suppressed and logged instead.
+            if self.agent.redact_errors:
+                logger.exception("Tool %r raised", tool_call.name)
+                content = (
+                    f"{type(exc).__name__} while running {tool_call.name!r} "
+                    "(details suppressed)."
+                )
+            else:
+                content = f"{type(exc).__name__}: {exc}"
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                content=content,
+                is_error=True,
+            )
+
+        content = str(output)
+        limit = (
+            tool.max_output_chars
+            if tool.max_output_chars is not None
+            else self.agent.max_tool_output_chars
+        )
+        if limit is not None:
+            content = _truncate_middle(content, limit)
         return ToolResult(
             tool_call_id=tool_call.id,
             name=tool_call.name,
-            content=str(output),
+            content=content,
             is_error=False,
         )
 
@@ -505,6 +546,21 @@ class AgentSession:
         """
 
         self._interrupt.set()
+
+
+def _truncate_middle(text: str, limit: int) -> str:
+    """Trim the middle of an over-long string, keeping the head and tail.
+
+    Large tool outputs can flood the context window; keeping both ends preserves
+    the most useful parts (a summary at the top, a result at the bottom) while
+    bounding size.
+    """
+
+    if len(text) <= limit:
+        return text
+    keep = limit // 2
+    omitted = len(text) - 2 * keep
+    return f"{text[:keep]}\n... [{omitted} characters omitted] ...\n{text[-keep:]}"
 
 
 def _as_skill(entry: Skill | str | Path) -> Skill:

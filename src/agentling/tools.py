@@ -7,11 +7,12 @@ final_answer tool used to terminate agent runs explicitly.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 import types
 from collections.abc import Callable
-from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, overload
 
 from .errors import AgentlingError
 from .models import ToolSpec
@@ -43,6 +44,12 @@ class Tool:
     # Optional per-tool time budget in seconds. None means use the agent's
     # tool_timeout default (which is itself None unless the caller sets it).
     timeout: float | None = None
+    # Whether this tool is safe to run concurrently with others in the same
+    # step. If any tool in a step is not parallel_safe, the step runs in order.
+    parallel_safe: bool = True
+    # Optional cap on observation length in characters. None means use the
+    # agent's max_tool_output_chars default.
+    max_output_chars: int | None = None
 
     async def forward(self, **kwargs: Any) -> Any:
         """Execute the tool implementation.
@@ -314,38 +321,66 @@ def _build_schema(func: Callable[..., Any]) -> JsonSchema:
     }
 
 
+_VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 class _FunctionTool(Tool):
     """Tool implementation backed by a plain Python function."""
 
     def __init__(self, func: Callable[..., Any]) -> None:
         summary, _ = _parse_docstring(func)
 
+        name = func.__name__
+        if not _VALID_TOOL_NAME.match(name):
+            raise ValueError(
+                f"Tool name {name!r} is not a valid tool name: use letters, "
+                "digits, underscore, or hyphen, up to 64 characters."
+            )
+
         self._func = func
-        self.name = func.__name__
+        self.name = name
         self.description = summary
         self.parameters = _build_schema(func)
 
     async def forward(self, **kwargs: Any) -> Any:
-        result = self._func(**kwargs)
-
-        # Support both sync and async functions. Only await values that are
-        # actually awaitable; ordinary return values pass through unchanged.
-        if inspect.isawaitable(result):
-            return await result
-
-        return result
+        # Async functions are awaited directly; a plain sync function runs in a
+        # worker thread so a blocking call (CPU or I/O) cannot stall the event
+        # loop, the stream, or other tools running in the same step.
+        if inspect.iscoroutinefunction(self._func):
+            return await self._func(**kwargs)
+        return await asyncio.to_thread(self._func, **kwargs)
 
 
-def tool(func: Callable[..., Any]) -> Tool:
+@overload
+def tool(func: Callable[..., Any]) -> Tool: ...
+
+
+@overload
+def tool(
+    *,
+    timeout: float | None = ...,
+    parallel_safe: bool = ...,
+    max_output_chars: int | None = ...,
+) -> Callable[[Callable[..., Any]], Tool]: ...
+
+
+def tool(
+    func: Callable[..., Any] | None = None,
+    *,
+    timeout: float | None = None,
+    parallel_safe: bool = True,
+    max_output_chars: int | None = None,
+) -> Tool | Callable[[Callable[..., Any]], Tool]:
     """Create a Tool from a plain Python function.
 
-    The function name becomes the tool name. The docstring summary becomes the
-    tool description. Argument descriptions are read from a Google-style Args
-    section, and type hints are converted into a JSON Schema parameters object.
+    The function name becomes the tool name, the docstring summary becomes the
+    description, argument descriptions come from a Google-style Args section,
+    and type hints become a JSON Schema parameters object. Synchronous and
+    asynchronous functions are both supported; sync functions run in a worker
+    thread so they cannot block the event loop.
 
-    Both synchronous and asynchronous functions are supported.
+    Use it bare, or with metadata:
 
-    Example:
         @tool
         def get_weather(city: str) -> str:
             '''Get the current weather for a city.
@@ -354,9 +389,22 @@ def tool(func: Callable[..., Any]) -> Tool:
                 city: The city to look up.
             '''
             ...
+
+        @tool(timeout=30, max_output_chars=2000, parallel_safe=False)
+        def run_query(sql: str) -> str:
+            ...
     """
 
-    return _FunctionTool(func)
+    def make(target: Callable[..., Any]) -> Tool:
+        built = _FunctionTool(target)
+        built.timeout = timeout
+        built.parallel_safe = parallel_safe
+        built.max_output_chars = max_output_chars
+        return built
+
+    if func is not None:
+        return make(func)
+    return make
 
 
 class FinalAnswerTool(Tool):

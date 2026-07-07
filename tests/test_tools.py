@@ -171,3 +171,48 @@ async def test_final_answer_tool() -> None:
     assert final.name == "final_answer"
     assert "answer" in props
     assert await final.call({"answer": "42"}) == "42"
+
+
+# --------------------------------------------------------------------------- #
+# @tool metadata and name validation
+# --------------------------------------------------------------------------- #
+def test_bare_tool_decorator_has_default_metadata() -> None:
+    @tool
+    def t(x: int) -> int:
+        """Doc.
+
+        Args:
+            x: A number.
+        """
+        return x
+
+    assert isinstance(t, Tool)
+    assert t.timeout is None
+    assert t.parallel_safe is True
+    assert t.max_output_chars is None
+
+
+def test_tool_decorator_accepts_metadata() -> None:
+    @tool(timeout=1.5, parallel_safe=False, max_output_chars=100)
+    def t(x: int) -> int:
+        """Doc.
+
+        Args:
+            x: A number.
+        """
+        return x
+
+    assert isinstance(t, Tool)
+    assert t.timeout == 1.5
+    assert t.parallel_safe is False
+    assert t.max_output_chars == 100
+
+
+def test_invalid_tool_name_is_rejected() -> None:
+    def f() -> str:
+        """A tool with a bad name."""
+        return ""
+
+    f.__name__ = "bad name!"
+    with pytest.raises(ValueError, match="valid tool name"):
+        tool(f)

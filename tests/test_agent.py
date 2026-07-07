@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from agentling.events import (
 from agentling.memory import ActionStep, FinalStep, TaskStep
 from agentling.models import ChatMessage, Delta, ToolCall, ToolCallDelta, Usage
 from agentling.skills import Skill
-from agentling.tools import tool
+from agentling.tools import ToolCallError, tool
 
 
 class FakeModel:
@@ -749,3 +750,128 @@ async def test_interrupt_during_stream_stops_the_run() -> None:
     model.session = session
 
     assert await session.run("stream") == "Run interrupted."
+
+
+# --------------------------------------------------------------------------- #
+# Tool execution hardening
+# --------------------------------------------------------------------------- #
+async def test_sync_tools_run_off_the_event_loop_thread() -> None:
+    @tool
+    def where() -> int:
+        """Return the id of the thread the tool ran on."""
+        return threading.get_ident()
+
+    model = FakeModel([_tool_turn("c1", "where"), _assistant(content="ok")])
+    agent = Agent(model=model, tools=[where])
+    session = agent.start()
+
+    await session.run("which thread")
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    # The sync tool ran in a worker thread, not the event loop's thread.
+    assert action.tool_results[0].content != str(threading.get_ident())
+
+
+async def test_tool_output_is_truncated() -> None:
+    @tool
+    def big() -> str:
+        """Return a large string."""
+        return "x" * 1000
+
+    model = FakeModel([_tool_turn("c1", "big"), _assistant(content="ok")])
+    agent = Agent(model=model, tools=[big], max_tool_output_chars=100)
+    session = agent.start()
+
+    await session.run("go")
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    content = action.tool_results[0].content
+    assert "characters omitted" in content
+    assert len(content) < 300
+
+
+async def test_errors_are_shown_by_default() -> None:
+    @tool
+    def leak() -> str:
+        """Raise with a message."""
+        raise RuntimeError("visible detail")
+
+    model = FakeModel([_tool_turn("c1", "leak"), _assistant(content="ok")])
+    agent = Agent(model=model, tools=[leak])
+    session = agent.start()
+
+    await session.run("go")
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert "visible detail" in action.tool_results[0].content
+
+
+async def test_error_redaction_hides_the_message() -> None:
+    @tool
+    def leak() -> str:
+        """Raise with a secret."""
+        raise RuntimeError("token=SECRET123")
+
+    model = FakeModel([_tool_turn("c1", "leak"), _assistant(content="ok")])
+    agent = Agent(model=model, tools=[leak], redact_errors=True)
+    session = agent.start()
+
+    await session.run("go")
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    content = action.tool_results[0].content
+    assert "SECRET123" not in content  # message suppressed
+    assert "RuntimeError" in content  # the type is still surfaced
+
+
+async def test_tool_call_error_shown_even_when_redacting() -> None:
+    @tool
+    def bad() -> str:
+        """Raise a ToolCallError."""
+        raise ToolCallError("use a positive number")
+
+    model = FakeModel([_tool_turn("c1", "bad"), _assistant(content="ok")])
+    agent = Agent(model=model, tools=[bad], redact_errors=True)
+    session = agent.start()
+
+    await session.run("go")
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert "use a positive number" in action.tool_results[0].content
+
+
+async def test_non_parallel_safe_tools_run_in_order() -> None:
+    order: list[str] = []
+
+    @tool(parallel_safe=False)
+    async def first() -> str:
+        """First tool."""
+        order.append("first-start")
+        await asyncio.sleep(0.02)
+        order.append("first-end")
+        return "1"
+
+    @tool
+    async def second() -> str:
+        """Second tool."""
+        order.append("second")
+        return "2"
+
+    model = FakeModel(
+        [
+            _assistant(
+                tool_calls=[
+                    ToolCall(id="c1", name="first", arguments={}),
+                    ToolCall(id="c2", name="second", arguments={}),
+                ]
+            ),
+            _assistant(content="done"),
+        ]
+    )
+    agent = Agent(model=model, tools=[first, second])
+    session = agent.start()
+
+    await session.run("go")
+    # first is not parallel_safe, so the step runs sequentially: it finishes
+    # before second starts.
+    assert order == ["first-start", "first-end", "second"]
