@@ -1,10 +1,21 @@
+import json
 from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agentling.agent import Agent
-from agentling.events import FinalEvent, StepEvent, ToolCallEvent, ToolResultEvent
+from agentling.events import (
+    FinalEvent,
+    StepEvent,
+    TextDelta,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 from agentling.memory import ActionStep, FinalStep, TaskStep
-from agentling.models import ChatMessage, Delta, ToolCall, Usage
+from agentling.models import ChatMessage, Delta, ToolCall, ToolCallDelta, Usage
+from agentling.skills import Skill
 from agentling.tools import tool
 
 
@@ -27,10 +38,28 @@ class FakeModel:
         self._index += 1
         return response
 
-    def stream(
+    async def stream(
         self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
     ) -> AsyncIterator[Delta]:
-        raise NotImplementedError
+        # Replay the next scripted response as a delta stream that
+        # agglomerate_deltas rebuilds into the same ChatMessage.
+        self.calls.append(list(messages))
+        response = self._responses[self._index]
+        self._index += 1
+        if response.content:
+            yield Delta(content=response.content)
+        for index, tc in enumerate(response.tool_calls):
+            yield Delta(
+                tool_calls=[
+                    ToolCallDelta(
+                        index=index,
+                        id=tc.id,
+                        name=tc.name,
+                        arguments=json.dumps(tc.arguments),
+                    )
+                ]
+            )
+        yield Delta(usage=response.usage)
 
 
 def _assistant(
@@ -53,6 +82,34 @@ def add(a: int, b: int) -> int:
         b: The second number.
     """
     return a + b
+
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers.
+
+    Args:
+        a: The first number.
+        b: The second number.
+    """
+    return a * b
+
+
+_REVIEWER_SKILL = Skill(
+    name="reviewer",
+    description="Review code for bugs and style issues.",
+    instructions="Look for off-by-one errors and missing null checks.",
+    path=Path("."),
+    tools=[],
+)
+
+_CALC_SKILL = Skill(
+    name="calc",
+    description="Do arithmetic with the multiply tool.",
+    instructions="Use the multiply tool to compute products.",
+    path=Path("."),
+    tools=[f"{__name__}:multiply"],
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +227,18 @@ async def test_streaming_yields_events() -> None:
     assert any(isinstance(e, StepEvent) for e in events)
     assert isinstance(events[-1], FinalEvent)
     assert events[-1].answer == "2"
+
+
+async def test_streaming_emits_text_deltas() -> None:
+    model = FakeModel([_assistant(content="hello world")])
+    agent = Agent(model=model)
+
+    texts = [
+        event.text
+        async for event in agent.run("hi", stream=True)
+        if isinstance(event, TextDelta)
+    ]
+    assert "".join(texts) == "hello world"
 
 
 # --------------------------------------------------------------------------- #
@@ -321,3 +390,121 @@ async def test_interrupt_then_resume_completes() -> None:
     assert await agent.run("continue", reset=False) == "finished on resume"
     assert len(model.calls) == 2
     assert sum(isinstance(s, TaskStep) for s in agent.memory.steps) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Skills: progressive disclosure
+# --------------------------------------------------------------------------- #
+def _load_skill_turn(call_id: str, skill_name: str) -> ChatMessage:
+    """A model turn calling load_skill (whose own argument is named 'name')."""
+    return _assistant(
+        tool_calls=[
+            ToolCall(id=call_id, name="load_skill", arguments={"name": skill_name})
+        ]
+    )
+
+
+def test_skill_catalog_is_added_to_the_system_prompt() -> None:
+    agent = Agent(model=FakeModel([]), skills=[_REVIEWER_SKILL])
+
+    assert "load_skill" in agent.tools
+    assert "reviewer" in agent.instructions
+    assert "Review code for bugs and style issues." in agent.instructions
+    # Only the name and description surface up front; the body stays hidden
+    # until the skill is loaded.
+    assert "off-by-one" not in agent.instructions
+
+
+def test_no_skills_means_no_load_skill_tool() -> None:
+    agent = Agent(model=FakeModel([]))
+
+    assert "load_skill" not in agent.tools
+
+
+async def test_load_skill_reveals_the_body() -> None:
+    model = FakeModel(
+        [
+            _load_skill_turn("c1", "reviewer"),
+            _assistant(content="done"),
+        ]
+    )
+    agent = Agent(model=model, skills=[_REVIEWER_SKILL])
+
+    assert await agent.run("review this") == "done"
+    action = agent.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert action.tool_results[0].content == _REVIEWER_SKILL.instructions
+    assert action.tool_results[0].is_error is False
+
+
+async def test_load_skill_registers_the_skills_tools() -> None:
+    model = FakeModel(
+        [
+            _load_skill_turn("c1", "calc"),
+            _tool_turn("c2", "multiply", a=6, b=7),
+            _assistant(content="42"),
+        ]
+    )
+    agent = Agent(model=model, skills=[_CALC_SKILL])
+
+    # multiply is hidden until the skill that provides it is loaded.
+    assert "multiply" not in agent.tools
+
+    assert await agent.run("compute six times seven") == "42"
+
+    assert "multiply" in agent.tools
+    load = agent.memory.steps[1]
+    assert isinstance(load, ActionStep)
+    assert "Tools now available: multiply." in load.tool_results[0].content
+    product = agent.memory.steps[2]
+    assert isinstance(product, ActionStep)
+    assert product.tool_results[0].content == "42"
+
+
+async def test_load_unknown_skill_is_an_error_observation() -> None:
+    model = FakeModel(
+        [
+            _load_skill_turn("c1", "ghost"),
+            _assistant(content="recovered"),
+        ]
+    )
+    agent = Agent(model=model, skills=[_REVIEWER_SKILL])
+
+    assert await agent.run("load a missing skill") == "recovered"
+    action = agent.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert action.tool_results[0].is_error is True
+    assert "Unknown skill" in action.tool_results[0].content
+
+
+def test_skill_can_be_loaded_from_a_path(tmp_path: Path) -> None:
+    folder = tmp_path / "greeter"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(
+        "---\nname: greeter\ndescription: Greet warmly.\n---\nSay hi.\n",
+        encoding="utf-8",
+    )
+    agent = Agent(model=FakeModel([]), skills=[folder])
+
+    assert "greeter" in agent.skills
+    assert "greeter" in agent.instructions
+
+
+# --------------------------------------------------------------------------- #
+# Construction guards
+# --------------------------------------------------------------------------- #
+def test_duplicate_tool_name_raises() -> None:
+    with pytest.raises(ValueError, match="Duplicate tool name"):
+        Agent(model=FakeModel([]), tools=[add, add])
+
+
+def test_max_steps_below_one_raises() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        Agent(model=FakeModel([]), max_steps=0)
+
+
+async def test_run_max_steps_below_one_raises() -> None:
+    agent = Agent(model=FakeModel([_assistant(content="unused")]))
+
+    with pytest.raises(ValueError, match="at least 1"):
+        await agent.run("hi", max_steps=0)

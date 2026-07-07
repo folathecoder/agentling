@@ -19,6 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "openai>=2.44.0",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -38,4 +39,5 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "types-PyYAML>=6.0",
 ]

@@ -10,6 +10,8 @@ was just recorded.
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from .memory import Step, ToolResult
@@ -54,3 +56,46 @@ class FinalEvent:
 
 # Public union type for the values yielded by the agent's event stream.
 Event = TextDelta | ToolCallEvent | ToolResultEvent | StepEvent | FinalEvent
+
+
+def _truncate(text: str, limit: int = 500) -> str:
+    """Shorten long tool output so a live stream stays readable."""
+
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def print_events(events: AsyncIterator[Event]) -> str:
+    """Render an agent's event stream to stdout as it arrives.
+
+    Consumes the iterator from Agent.run(..., stream=True): assistant text
+    prints token by token, each tool call and its result get their own line,
+    and the final answer is shown at the end. Returns that answer so the caller
+    can keep using it once the run has been displayed.
+    """
+
+    answer = ""
+    mid_line = False  # True while streamed text has left the cursor mid-line.
+
+    async for event in events:
+        match event:
+            case TextDelta(text=text):
+                print(text, end="", flush=True)
+                mid_line = True
+            case ToolCallEvent(tool_call=call):
+                if mid_line:
+                    print()
+                    mid_line = False
+                print(f"-> {call.name}({json.dumps(call.arguments)})")
+            case ToolResultEvent(result=result):
+                status = "error" if result.is_error else "ok"
+                print(f"<- [{status}] {_truncate(result.content)}")
+            case FinalEvent(answer=final):
+                if mid_line:
+                    print()
+                    mid_line = False
+                answer = final
+                print(f"= {final}")
+            case StepEvent():
+                pass  # Its contents already surfaced through the events above.
+
+    return answer

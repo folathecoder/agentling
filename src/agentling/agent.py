@@ -4,21 +4,34 @@ Agent ties the framework's primitives (a Model, some Tools, and a Memory of
 typed steps) into an async ReAct loop. One async generator, _run_stream, does
 the real work and yields Events. run() is a thin dispatcher: it hands back that
 stream when stream is True, or drains it and returns the final answer otherwise.
+
+Skills are disclosed progressively: only their names and descriptions are added
+to the system prompt up front. The full instructions, and any tools a skill
+declares, arrive when the model calls the built-in load_skill tool.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 import json
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import replace
-from collections.abc import AsyncIterator, Callable, Sequence
-from typing import Any
+from pathlib import Path
+from typing import Literal, overload
 
-from .events import Event, FinalEvent, StepEvent, ToolCallEvent, ToolResultEvent
+from .events import (
+    Event,
+    FinalEvent,
+    StepEvent,
+    TextDelta,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 from .memory import ActionStep, FinalStep, Memory, Step, TaskStep, ToolResult
-from .models import ChatMessage, Model, ToolCall
-from .tools import FinalAnswerTool, Tool
+from .models import ChatMessage, Delta, Model, ToolCall, ToolSpec, agglomerate_deltas
+from .skills import Skill
+from .tools import FinalAnswerTool, Tool, ToolCallError, tool
 
 DEFAULT_INSTRUCTIONS = (
     "You are a helpful agent. Use the available tools to gather information or "
@@ -43,25 +56,75 @@ class Agent:
         self,
         model: Model,
         tools: Sequence[Tool] = (),
-        skills: Sequence[Any] = (),
+        skills: Sequence[Skill | str | Path] = (),
         instructions: str | None = None,
         max_steps: int = 15,
         step_callbacks: Sequence[Callable[[Step], None]] = (),
         parallel_tools: bool = True,
     ) -> None:
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1.")
+
         self.model = model
-        self.instructions = instructions or DEFAULT_INSTRUCTIONS
         self.max_steps = max_steps
         self.step_callbacks = list(step_callbacks)
         self.parallel_tools = parallel_tools
-        self.skills = list(skills)  # accepted but not consumed yet
 
         self.memory = Memory()
         self._interrupt = asyncio.Event()
 
-        all_tools = [*tools, FinalAnswerTool()]
-        self.tools: dict[str, Tool] = {tool.name: tool for tool in all_tools}
-        self._tool_schemas = [tool.to_schema() for tool in all_tools]
+        # Register the caller's tools plus the always-available final_answer. A
+        # duplicate name among these is a programming error, so fail loudly here
+        # rather than silently letting one tool shadow another.
+        self.tools: dict[str, Tool] = {}
+        self._tool_schemas: list[ToolSpec] = []
+        for base_tool in (*tools, FinalAnswerTool()):
+            if base_tool.name in self.tools:
+                raise ValueError(f"Duplicate tool name: {base_tool.name!r}")
+            self._register_tool(base_tool)
+
+        # Load skills up front but reveal only their names and descriptions. The
+        # full instructions and any skill tools arrive when the model calls
+        # load_skill, which keeps the base context small (progressive disclosure).
+        self.skills: dict[str, Skill] = {
+            skill.name: skill for skill in (_as_skill(entry) for entry in skills)
+        }
+        self.instructions = instructions or DEFAULT_INSTRUCTIONS
+        if self.skills:
+            self._register_tool(self._build_load_skill_tool())
+            self.instructions += _skill_catalog(self.skills.values())
+
+    def _register_tool(self, new_tool: Tool) -> None:
+        """Add a tool to the live tool set, skipping names already registered.
+
+        Registration is idempotent so a skill can be loaded more than once, or
+        declare a tool the agent already has, without raising mid-run.
+        """
+
+        if new_tool.name in self.tools:
+            return
+        self.tools[new_tool.name] = new_tool
+        self._tool_schemas.append(new_tool.to_schema())
+
+    @overload
+    def run(
+        self,
+        task: str,
+        *,
+        stream: Literal[False] = False,
+        reset: bool = True,
+        max_steps: int | None = None,
+    ) -> Awaitable[str]: ...
+
+    @overload
+    def run(
+        self,
+        task: str,
+        *,
+        stream: Literal[True],
+        reset: bool = True,
+        max_steps: int | None = None,
+    ) -> AsyncIterator[Event]: ...
 
     def run(
         self,
@@ -70,10 +133,10 @@ class Agent:
         stream: bool = False,
         reset: bool = True,
         max_steps: int | None = None,
-    ) -> Any:
+    ) -> Awaitable[str] | AsyncIterator[Event]:
         """Run the agent on a task.
 
-        With stream=False (the default) this returns a coroutine that resolves
+        With stream=False (the default) this returns an awaitable that resolves
         to the final answer string:
 
             answer = await agent.run(task)
@@ -83,6 +146,7 @@ class Agent:
             async for event in agent.run(task, stream=True):
                 ...
         """
+
         events = self._run_stream(task, reset=reset, max_steps=max_steps)
         if stream:
             return events
@@ -90,6 +154,7 @@ class Agent:
 
     async def _drain(self, events: AsyncIterator[Event]) -> str:
         """Consume the event stream and return the final answer."""
+
         answer = ""
         async for event in events:
             if isinstance(event, FinalEvent):
@@ -100,12 +165,16 @@ class Agent:
         self, task: str, *, reset: bool = True, max_steps: int | None = None
     ) -> AsyncIterator[Event]:
         """The core loop: drive the model/tool cycle, yielding Events."""
+
         if reset:
             self.memory.reset()
 
+        if max_steps is not None and max_steps < 1:
+            raise ValueError("max_steps must be at least 1.")
+
         self.memory.add(TaskStep(task=task))
 
-        limit = max_steps or self.max_steps
+        limit = self.max_steps if max_steps is None else max_steps
 
         # Remember the previous step's calls so we can spot an exact repeat.
         previous_signature: tuple[tuple[str, str], ...] | None = None
@@ -118,7 +187,16 @@ class Agent:
 
             started = time.monotonic()
             messages = self.memory.to_messages(self.instructions)
-            response = await self.model.generate(messages, tools=self._tool_schemas)
+
+            # Stream the model turn: emit text as it arrives, then rebuild the
+            # full ChatMessage from the deltas for the rest of the step to use.
+            deltas: list[Delta] = []
+            async for delta in self.model.stream(messages, tools=self._tool_schemas):
+                if delta.content:
+                    yield TextDelta(text=delta.content)
+                deltas.append(delta)
+
+            response = agglomerate_deltas(deltas)
 
             # Forgiving termination: no tool calls means the content is the answer.
             if not response.tool_calls:
@@ -181,12 +259,22 @@ class Agent:
                 content="Step limit reached. Give your best final answer now.",
             )
         )
-        response = await self.model.generate(messages)
+
+        deltas = []
+
+        async for delta in self.model.stream(messages):
+            if delta.content:
+                yield TextDelta(text=delta.content)
+            deltas.append(delta)
+
+        response = agglomerate_deltas(deltas)
         self.memory.add(FinalStep(answer=response.content))
+
         yield FinalEvent(answer=response.content, usage=response.usage)
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Run one tool call, turning any failure into an error observation."""
+
         tool = self.tools.get(tool_call.name)
         if tool is None:
             return ToolResult(
@@ -216,10 +304,63 @@ class Agent:
             is_error=False,
         )
 
+    def _build_load_skill_tool(self) -> Tool:
+        """Build the built-in load_skill tool, bound to this agent's skills."""
+
+        @tool
+        def load_skill(name: str) -> str:
+            """Load a skill's full instructions and enable any tools it provides.
+
+            Args:
+                name: The name of the skill to load, taken from the catalog in
+                    the system prompt.
+            """
+
+            skill = self.skills.get(name)
+            if skill is None:
+                raise ToolCallError(
+                    f"Unknown skill {name!r}. Available: {sorted(self.skills)}"
+                )
+
+            loaded = skill.load_tools()
+            for skill_tool in loaded:
+                self._register_tool(skill_tool)
+
+            body = skill.instructions
+            if loaded:
+                names = ", ".join(skill_tool.name for skill_tool in loaded)
+                body += f"\n\nTools now available: {names}."
+            return body
+
+        return load_skill
+
     def interrupt(self) -> None:
         """Request a graceful stop before the next step.
 
         The current run pauses rather than crashing; resume it later with
         run(..., reset=False), which continues from the steps already in memory.
         """
+
         self._interrupt.set()
+
+
+def _as_skill(entry: Skill | str | Path) -> Skill:
+    """Coerce a skill entry (a Skill, or a path to a skill folder) into a Skill."""
+
+    return entry if isinstance(entry, Skill) else Skill.from_path(entry)
+
+
+def _skill_catalog(skills: Iterable[Skill]) -> str:
+    """Render the skill catalog appended to the system prompt.
+
+    Only names and descriptions are listed. The full instructions stay out of
+    the prompt until the model loads a skill (progressive disclosure).
+    """
+
+    lines = "\n".join(f"- {skill.name}: {skill.description}" for skill in skills)
+    return (
+        "\n\nYou can load skills: focused instruction sets for particular kinds "
+        "of task. When the task matches one, call load_skill(name) to load its "
+        "full instructions and any tools it provides before continuing. "
+        "Available skills:\n" + lines
+    )
