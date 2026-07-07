@@ -288,3 +288,41 @@ async def test_retry_gives_up_after_max_retries() -> None:
 
     with pytest.raises(openai.RateLimitError):
         await model.generate([ChatMessage(role="user", content="hi")])
+
+
+async def test_retry_on_transient_api_error() -> None:
+    calls = 0
+    result = SimpleNamespace(
+        choices=[
+            SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None))
+        ],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+
+    async def flaky(**kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise openai.APIConnectionError.__new__(openai.APIConnectionError)
+        return result
+
+    model = _make_model(flaky)
+    msg = await model.generate([ChatMessage(role="user", content="hi")])
+
+    assert msg.content == "ok"
+    assert calls == 2  # transient error retried, then succeeded
+
+
+async def test_permanent_error_is_not_retried() -> None:
+    calls = 0
+
+    async def always_bad(**kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise openai.BadRequestError.__new__(openai.BadRequestError)
+
+    model = _make_model(always_bad)
+
+    with pytest.raises(openai.BadRequestError):
+        await model.generate([ChatMessage(role="user", content="hi")])
+    assert calls == 1  # permanent error fails fast — no retry
