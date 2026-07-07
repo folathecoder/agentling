@@ -46,6 +46,7 @@ asyncio.run(main())
 - [Why agentling](#why-agentling)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Examples](#examples)
 - [Usage](#usage)
   - [Tools](#tools)
   - [Running: blocking vs streaming](#running-blocking-vs-streaming)
@@ -125,6 +126,43 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+## Examples
+
+Runnable examples live in [`examples/`](examples/). The offline ones need no API
+key; the rest use an OpenAI-compatible model (set `OPENAI_API_KEY`, and
+optionally `AGENTLING_EXAMPLE_MODEL`).
+
+Offline (no API key):
+
+```bash
+uv run python examples/cli_failure_recovery.py   # recover from tool errors
+uv run python examples/cli_memory_chat.py        # persist and continue a session
+uv run python examples/cli_advanced_observer.py  # watch every event type
+```
+
+Needs an API key:
+
+```bash
+uv run python examples/cli_math_tutor.py               # smallest useful agent
+uv run python examples/cli_repo_assistant.py "..."     # streaming + safe file tools
+uv run python examples/cli_notes_agent.py              # file-backed notes tools
+```
+
+What each one covers:
+
+| Feature | Example |
+| --- | --- |
+| Basic tool calling | `cli_math_tutor.py` |
+| Streaming events (`print_events`) | `cli_repo_assistant.py`, `cli_advanced_observer.py` |
+| Every event type + `context_manager` | `cli_advanced_observer.py` |
+| Safe, sandboxed file tools | `cli_repo_assistant.py`, `cli_notes_agent.py` |
+| Failure recovery (tool errors) | `cli_failure_recovery.py` |
+| Memory persistence + `reset=False` | `cli_memory_chat.py` |
+| Skills (progressive disclosure) | `cli_repo_assistant.py`, [`skills/code-reviewer`](examples/skills/code-reviewer) |
+| Timeouts, redaction, `parallel_safe` | `cli_notes_agent.py` |
+| `max_tool_output_chars` | `cli_repo_assistant.py` |
+| Custom scripted/fake model | `cli_failure_recovery.py`, `cli_memory_chat.py` |
 
 ## Usage
 
