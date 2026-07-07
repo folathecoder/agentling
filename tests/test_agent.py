@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from agentling.agent import Agent
+from agentling.errors import ModelError
 from agentling.events import (
     FinalEvent,
     StepEvent,
@@ -567,3 +568,66 @@ async def test_interrupt_affects_only_its_session() -> None:
     assert await s1.run("stop") == "Run interrupted."
     # s2 is unaffected and runs to completion.
     assert await s2.run("go") == "s2 done"
+
+
+# --------------------------------------------------------------------------- #
+# Malformed model output (recoverable)
+# --------------------------------------------------------------------------- #
+class _MalformedThenAnswerModel:
+    """Streams one unparseable tool call, then a plain answer on the retry."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> ChatMessage:
+        raise NotImplementedError
+
+    async def stream(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> AsyncIterator[Delta]:
+        self.calls += 1
+        if self.calls == 1:
+            yield Delta(
+                tool_calls=[
+                    ToolCallDelta(index=0, id="c1", name="add", arguments="{bad json")
+                ]
+            )
+        else:
+            yield Delta(content="recovered")
+        yield Delta(usage=Usage(1, 1))
+
+
+class _AlwaysMalformedModel:
+    """Every turn streams an unparseable tool call."""
+
+    async def generate(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> ChatMessage:
+        raise NotImplementedError
+
+    async def stream(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> AsyncIterator[Delta]:
+        yield Delta(
+            tool_calls=[
+                ToolCallDelta(index=0, id="c1", name="add", arguments="{bad json")
+            ]
+        )
+        yield Delta(usage=Usage(1, 1))
+
+
+async def test_malformed_tool_call_is_recoverable() -> None:
+    model = _MalformedThenAnswerModel()
+    agent = Agent(model=model)
+
+    assert await agent.run("do something") == "recovered"
+    assert model.calls == 2  # first turn malformed, re-prompted, then answered
+
+
+async def test_persistently_malformed_output_raises_model_error() -> None:
+    agent = Agent(model=_AlwaysMalformedModel())
+
+    with pytest.raises(ModelError):
+        await agent.run("do something")

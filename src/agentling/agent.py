@@ -28,6 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal, overload
 
+from .errors import ModelError, ModelOutputError
 from .events import (
     Event,
     FinalEvent,
@@ -51,6 +52,9 @@ _LOOP_NUDGE = (
     " Note: you already made this exact tool call and got the same result. "
     "Try a different approach."
 )
+
+# How many consecutive unparseable model turns to tolerate before giving up.
+_MAX_MALFORMED_RETRIES = 2
 
 
 class Agent:
@@ -254,6 +258,11 @@ class AgentSession:
         # Remember the previous step's calls so we can spot an exact repeat.
         previous_signature: tuple[tuple[str, str], ...] | None = None
 
+        # Corrective user messages appended to the prompt after the model emits
+        # unparseable output, so it can retry. Cleared once a turn parses.
+        correction_notes: list[ChatMessage] = []
+        malformed_retries = 0
+
         for _ in range(limit):
             if self._interrupt.is_set():
                 self._interrupt.clear()
@@ -262,6 +271,7 @@ class AgentSession:
 
             started = time.monotonic()
             messages = self.memory.to_messages(self.agent.instructions)
+            messages.extend(correction_notes)
 
             # Stream the model turn: emit text as it arrives, then rebuild the
             # full ChatMessage from the deltas for the rest of the step to use.
@@ -273,7 +283,33 @@ class AgentSession:
                     yield TextDelta(text=delta.content)
                 deltas.append(delta)
 
-            response = agglomerate_deltas(deltas)
+            # Malformed tool calls (bad JSON, missing name) are recoverable:
+            # re-prompt the model with a correction, up to a small cap, rather
+            # than crashing the run.
+            try:
+                response = agglomerate_deltas(deltas)
+            except ModelOutputError as exc:
+                malformed_retries += 1
+                if malformed_retries > _MAX_MALFORMED_RETRIES:
+                    raise ModelError(
+                        f"Model produced unparseable tool calls on "
+                        f"{malformed_retries} consecutive turns: {exc}"
+                    ) from exc
+                correction_notes.append(
+                    ChatMessage(
+                        role="user",
+                        content=(
+                            f"Your previous response could not be parsed: {exc} "
+                            "Reply again with valid tool-call arguments as a JSON "
+                            "object."
+                        ),
+                    )
+                )
+                continue
+
+            # A well-formed turn clears any accumulated corrections.
+            correction_notes.clear()
+            malformed_retries = 0
 
             # Forgiving termination: no tool calls means the content is the answer.
             if not response.tool_calls:
@@ -343,7 +379,13 @@ class AgentSession:
                 yield TextDelta(text=delta.content)
             deltas.append(delta)
 
-        response = agglomerate_deltas(deltas)
+        try:
+            response = agglomerate_deltas(deltas)
+        except ModelOutputError as exc:
+            raise ModelError(
+                f"Model produced unparseable output on the forced final answer: {exc}"
+            ) from exc
+
         self.memory.add(FinalStep(answer=response.content))
         yield FinalEvent(answer=response.content, usage=response.usage)
 
