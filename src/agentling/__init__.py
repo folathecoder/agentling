@@ -6,7 +6,7 @@ under it are implementation detail and may be reorganized.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .agent import Agent
+from .agent import Agent, AgentSession
 from .errors import (
     AgentlingError,
     AgentRunError,
@@ -48,6 +48,7 @@ except PackageNotFoundError:  # Running from a source tree without an install.
 __all__ = [
     # Core
     "Agent",
+    "AgentSession",
     "Model",
     "OpenAIModel",
     "Skill",

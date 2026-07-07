@@ -118,12 +118,13 @@ _CALC_SKILL = Skill(
 async def test_forgiving_termination_returns_content() -> None:
     model = FakeModel([_assistant(content="42")])
     agent = Agent(model=model)
+    session = agent.start()
 
-    answer = await agent.run("What is 6 times 7?")
+    answer = await session.run("What is 6 times 7?")
 
     assert answer == "42"
-    assert isinstance(agent.memory.steps[0], TaskStep)
-    assert isinstance(agent.memory.steps[-1], FinalStep)
+    assert isinstance(session.memory.steps[0], TaskStep)
+    assert isinstance(session.memory.steps[-1], FinalStep)
 
 
 async def test_explicit_final_answer() -> None:
@@ -154,11 +155,12 @@ async def test_tool_call_then_answer() -> None:
         ]
     )
     agent = Agent(model=model, tools=[add])
+    session = agent.start()
 
-    answer = await agent.run("add 2 and 3")
+    answer = await session.run("add 2 and 3")
 
     assert answer == "The sum is 5."
-    action = agent.memory.steps[1]
+    action = session.memory.steps[1]
     assert isinstance(action, ActionStep)
     assert action.tool_results[0].content == "5"
     assert action.tool_results[0].is_error is False
@@ -199,9 +201,10 @@ async def test_tool_error_becomes_observation() -> None:
         ]
     )
     agent = Agent(model=model, tools=[boom])
+    session = agent.start()
 
-    assert await agent.run("try boom") == "recovered"
-    action = agent.memory.steps[1]
+    assert await session.run("try boom") == "recovered"
+    action = session.memory.steps[1]
     assert isinstance(action, ActionStep)
     assert action.tool_results[0].is_error is True
 
@@ -282,9 +285,10 @@ async def test_loop_detector_nudges_on_repeat() -> None:
         ]
     )
     agent = Agent(model=model, tools=[add])
-    await agent.run("repeat the same call")
+    session = agent.start()
+    await session.run("repeat the same call")
 
-    first, second = agent.memory.steps[1], agent.memory.steps[2]
+    first, second = session.memory.steps[1], session.memory.steps[2]
     assert isinstance(first, ActionStep)
     assert isinstance(second, ActionStep)
     assert _REPEAT_MARKER not in first.tool_results[0].content
@@ -300,9 +304,10 @@ async def test_loop_detector_ignores_different_args() -> None:
         ]
     )
     agent = Agent(model=model, tools=[add])
-    await agent.run("two different sums")
+    session = agent.start()
+    await session.run("two different sums")
 
-    for step in agent.memory.steps:
+    for step in session.memory.steps:
         if isinstance(step, ActionStep):
             assert _REPEAT_MARKER not in step.tool_results[0].content
 
@@ -313,10 +318,11 @@ async def test_loop_detector_ignores_different_args() -> None:
 async def test_unknown_tool_recovers() -> None:
     model = FakeModel([_tool_turn("c1", "ghost"), _assistant(content="recovered")])
     agent = Agent(model=model)  # only final_answer is registered
-    answer = await agent.run("call a missing tool")
+    session = agent.start()
+    answer = await session.run("call a missing tool")
 
     assert answer == "recovered"
-    action = agent.memory.steps[1]
+    action = session.memory.steps[1]
     assert isinstance(action, ActionStep)
     assert action.tool_results[0].is_error is True
     assert "Unknown tool" in action.tool_results[0].content
@@ -335,10 +341,11 @@ async def test_always_raising_tool_recovers() -> None:
         ]
     )
     agent = Agent(model=model, tools=[boom])
-    answer = await agent.run("trigger boom")
+    session = agent.start()
+    answer = await session.run("trigger boom")
 
     assert answer == "handled"
-    action = agent.memory.steps[1]
+    action = session.memory.steps[1]
     assert isinstance(action, ActionStep)
     assert action.tool_results[0].is_error is True
     assert "RuntimeError" in action.tool_results[0].content
@@ -352,18 +359,19 @@ async def test_interrupt_stops_run_gracefully() -> None:
         [_tool_turn("c1", "add", a=1, b=1), _assistant(content="unreached")]
     )
     agent = Agent(model=model, tools=[add])
+    session = agent.start()
 
     fired: list[bool] = []
 
     def interrupt_after_first(step: object) -> None:
         if not fired:
             fired.append(True)
-            agent.interrupt()
+            session.interrupt()
 
-    agent.step_callbacks.append(interrupt_after_first)
+    session.step_callbacks.append(interrupt_after_first)
 
-    assert await agent.run("loop") == "Run interrupted."
-    assert isinstance(agent.memory.steps[-1], ActionStep)  # paused before a FinalStep
+    assert await session.run("loop") == "Run interrupted."
+    assert isinstance(session.memory.steps[-1], ActionStep)  # paused before a FinalStep
     assert len(model.calls) == 1
 
 
@@ -375,21 +383,22 @@ async def test_interrupt_then_resume_completes() -> None:
         ]
     )
     agent = Agent(model=model, tools=[add])
+    session = agent.start()
 
     fired: list[bool] = []
 
     def interrupt_once(step: object) -> None:
         if not fired:
             fired.append(True)
-            agent.interrupt()
+            session.interrupt()
 
-    agent.step_callbacks.append(interrupt_once)
+    session.step_callbacks.append(interrupt_once)
 
-    assert await agent.run("start") == "Run interrupted."
+    assert await session.run("start") == "Run interrupted."
     # reset=False keeps the interrupted run's memory; the loop resumes from it.
-    assert await agent.run("continue", reset=False) == "finished on resume"
+    assert await session.run("continue", reset=False) == "finished on resume"
     assert len(model.calls) == 2
-    assert sum(isinstance(s, TaskStep) for s in agent.memory.steps) == 2
+    assert sum(isinstance(s, TaskStep) for s in session.memory.steps) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -406,8 +415,9 @@ def _load_skill_turn(call_id: str, skill_name: str) -> ChatMessage:
 
 def test_skill_catalog_is_added_to_the_system_prompt() -> None:
     agent = Agent(model=FakeModel([]), skills=[_REVIEWER_SKILL])
+    session = agent.start()
 
-    assert "load_skill" in agent.tools
+    assert "load_skill" in session.tools
     assert "reviewer" in agent.instructions
     assert "Review code for bugs and style issues." in agent.instructions
     # Only the name and description surface up front; the body stays hidden
@@ -418,7 +428,7 @@ def test_skill_catalog_is_added_to_the_system_prompt() -> None:
 def test_no_skills_means_no_load_skill_tool() -> None:
     agent = Agent(model=FakeModel([]))
 
-    assert "load_skill" not in agent.tools
+    assert "load_skill" not in agent.start().tools
 
 
 async def test_load_skill_reveals_the_body() -> None:
@@ -429,9 +439,10 @@ async def test_load_skill_reveals_the_body() -> None:
         ]
     )
     agent = Agent(model=model, skills=[_REVIEWER_SKILL])
+    session = agent.start()
 
-    assert await agent.run("review this") == "done"
-    action = agent.memory.steps[1]
+    assert await session.run("review this") == "done"
+    action = session.memory.steps[1]
     assert isinstance(action, ActionStep)
     assert action.tool_results[0].content == _REVIEWER_SKILL.instructions
     assert action.tool_results[0].is_error is False
@@ -446,17 +457,18 @@ async def test_load_skill_registers_the_skills_tools() -> None:
         ]
     )
     agent = Agent(model=model, skills=[_CALC_SKILL])
+    session = agent.start()
 
     # multiply is hidden until the skill that provides it is loaded.
-    assert "multiply" not in agent.tools
+    assert "multiply" not in session.tools
 
-    assert await agent.run("compute six times seven") == "42"
+    assert await session.run("compute six times seven") == "42"
 
-    assert "multiply" in agent.tools
-    load = agent.memory.steps[1]
+    assert "multiply" in session.tools
+    load = session.memory.steps[1]
     assert isinstance(load, ActionStep)
     assert "Tools now available: multiply." in load.tool_results[0].content
-    product = agent.memory.steps[2]
+    product = session.memory.steps[2]
     assert isinstance(product, ActionStep)
     assert product.tool_results[0].content == "42"
 
@@ -469,9 +481,10 @@ async def test_load_unknown_skill_is_an_error_observation() -> None:
         ]
     )
     agent = Agent(model=model, skills=[_REVIEWER_SKILL])
+    session = agent.start()
 
-    assert await agent.run("load a missing skill") == "recovered"
-    action = agent.memory.steps[1]
+    assert await session.run("load a missing skill") == "recovered"
+    action = session.memory.steps[1]
     assert isinstance(action, ActionStep)
     assert action.tool_results[0].is_error is True
     assert "Unknown skill" in action.tool_results[0].content
@@ -508,3 +521,49 @@ async def test_run_max_steps_below_one_raises() -> None:
 
     with pytest.raises(ValueError, match="at least 1"):
         await agent.run("hi", max_steps=0)
+
+
+# --------------------------------------------------------------------------- #
+# Session isolation
+# --------------------------------------------------------------------------- #
+async def test_sessions_keep_separate_memory() -> None:
+    agent = Agent(model=FakeModel([_assistant(content="one")]))
+    s1 = agent.start()
+    s2 = agent.start()
+
+    await s1.run("first")
+
+    assert s1.memory is not s2.memory
+    assert len(s1.memory.steps) > 0
+    assert s2.memory.steps == []  # a sibling session is untouched
+
+
+async def test_skill_tools_do_not_leak_between_sessions() -> None:
+    model = FakeModel(
+        [
+            _load_skill_turn("c1", "calc"),
+            _tool_turn("c2", "multiply", a=2, b=2),
+            _assistant(content="4"),
+        ]
+    )
+    agent = Agent(model=model, skills=[_CALC_SKILL])
+    loader = agent.start()
+    other = agent.start()
+
+    await loader.run("use calc")
+
+    assert "multiply" in loader.tools  # registered by load_skill in this session
+    assert "multiply" not in other.tools  # never leaks into a sibling session
+
+
+async def test_interrupt_affects_only_its_session() -> None:
+    agent = Agent(model=FakeModel([_assistant(content="s2 done")]))
+    s1 = agent.start()
+    s2 = agent.start()
+
+    s1.interrupt()
+
+    # s1 sees its own interrupt and stops before the first step (no model call).
+    assert await s1.run("stop") == "Run interrupted."
+    # s2 is unaffected and runs to completion.
+    assert await s2.run("go") == "s2 done"

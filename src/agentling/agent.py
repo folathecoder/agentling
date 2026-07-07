@@ -1,9 +1,17 @@
 """The agent loop.
 
-Agent ties the framework's primitives (a Model, some Tools, and a Memory of
-typed steps) into an async ReAct loop. One async generator, _run_stream, does
-the real work and yields Events. run() is a thin dispatcher: it hands back that
-stream when stream is True, or drains it and returns the final answer otherwise.
+Agent holds immutable configuration (a Model, some Tools, some Skills, and the
+run settings) and acts as a factory for sessions. AgentSession owns one
+conversation's mutable state (a Memory of typed steps, an interrupt token, and
+its own tool set) and runs the ReAct loop.
+
+Splitting the two means a single Agent can be built once and shared safely
+across concurrent runs: each run gets its own AgentSession, so memories,
+interrupts, and dynamically loaded skill tools never leak between them.
+
+One async generator, AgentSession._run_stream, does the real work and yields
+Events. run() is a thin dispatcher: it hands back that stream when stream is
+True, or drains it and returns the final answer otherwise.
 
 Skills are disclosed progressively: only their names and descriptions are added
 to the system prompt up front. The full instructions, and any tools a skill
@@ -46,10 +54,12 @@ _LOOP_NUDGE = (
 
 
 class Agent:
-    """An async tool-calling agent.
+    """Immutable configuration and a factory for sessions.
 
-    Wires a Model, Tools (with final_answer always available), and a Memory into
-    a ReAct loop. Call run() to execute a task, optionally streaming Events.
+    An Agent bundles a Model, the base Tools (final_answer is always added),
+    Skills, and the run settings. It holds no per-run state, so one Agent can be
+    built once and shared across many concurrent runs. Call start() for a fresh
+    session, or run() for a one-shot convenience run.
     """
 
     def __init__(
@@ -67,21 +77,24 @@ class Agent:
 
         self.model = model
         self.max_steps = max_steps
-        self.step_callbacks = list(step_callbacks)
         self.parallel_tools = parallel_tools
+        # Default callbacks applied to every session. A session copies these and
+        # may append its own.
+        self.step_callbacks = list(step_callbacks)
 
-        self.memory = Memory()
-        self._interrupt = asyncio.Event()
-
-        # Register the caller's tools plus the always-available final_answer. A
-        # duplicate name among these is a programming error, so fail loudly here
-        # rather than silently letting one tool shadow another.
-        self.tools: dict[str, Tool] = {}
-        self._tool_schemas: list[ToolSpec] = []
+        # Base tool set: the caller's tools plus the always-available
+        # final_answer. A duplicate name here is a programming error, so fail
+        # loudly rather than letting one tool shadow another. Each session gets
+        # its own copy of this set (see AgentSession).
+        base_tools: dict[str, Tool] = {}
+        base_schemas: list[ToolSpec] = []
         for base_tool in (*tools, FinalAnswerTool()):
-            if base_tool.name in self.tools:
+            if base_tool.name in base_tools:
                 raise ValueError(f"Duplicate tool name: {base_tool.name!r}")
-            self._register_tool(base_tool)
+            base_tools[base_tool.name] = base_tool
+            base_schemas.append(base_tool.to_schema())
+        self._base_tools = base_tools
+        self._base_schemas = base_schemas
 
         # Load skills up front but reveal only their names and descriptions. The
         # full instructions and any skill tools arrive when the model calls
@@ -91,14 +104,81 @@ class Agent:
         }
         self.instructions = instructions or DEFAULT_INSTRUCTIONS
         if self.skills:
-            self._register_tool(self._build_load_skill_tool())
             self.instructions += _skill_catalog(self.skills.values())
 
+    def start(self) -> AgentSession:
+        """Create a fresh session with its own memory, tools, and interrupt token."""
+
+        return AgentSession(self)
+
+    @overload
+    def run(
+        self,
+        task: str,
+        *,
+        stream: Literal[False] = False,
+        reset: bool = True,
+        max_steps: int | None = None,
+    ) -> Awaitable[str]: ...
+
+    @overload
+    def run(
+        self,
+        task: str,
+        *,
+        stream: Literal[True],
+        reset: bool = True,
+        max_steps: int | None = None,
+    ) -> AsyncIterator[Event]: ...
+
+    def run(
+        self,
+        task: str,
+        *,
+        stream: bool = False,
+        reset: bool = True,
+        max_steps: int | None = None,
+    ) -> Awaitable[str] | AsyncIterator[Event]:
+        """Run a task on a fresh one-shot session.
+
+        Convenience for the common single-run case. Each call gets its own
+        session, so concurrent calls on one Agent stay isolated. For a multi-turn
+        conversation, or to inspect memory afterwards, use start() and hold on to
+        the session.
+        """
+
+        session = self.start()
+        if stream:
+            return session.run(task, stream=True, reset=reset, max_steps=max_steps)
+        return session.run(task, stream=False, reset=reset, max_steps=max_steps)
+
+
+class AgentSession:
+    """One conversation's mutable state plus the agent loop.
+
+    A session owns its own Memory, interrupt token, and tool set (a copy of the
+    Agent's base tools, so skill tools loaded here never leak into another
+    session). Create one with Agent.start().
+    """
+
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+        self.memory = Memory()
+        self.step_callbacks = list(agent.step_callbacks)
+        self._interrupt = asyncio.Event()
+
+        # Per-session tool view. Copying the agent's base set keeps any skill
+        # tools loaded during this run isolated to this session.
+        self.tools: dict[str, Tool] = dict(agent._base_tools)
+        self._tool_schemas: list[ToolSpec] = list(agent._base_schemas)
+        if agent.skills:
+            self._register_tool(self._build_load_skill_tool())
+
     def _register_tool(self, new_tool: Tool) -> None:
-        """Add a tool to the live tool set, skipping names already registered.
+        """Add a tool to this session's tool set, skipping names already present.
 
         Registration is idempotent so a skill can be loaded more than once, or
-        declare a tool the agent already has, without raising mid-run.
+        declare a tool the session already has, without raising mid-run.
         """
 
         if new_tool.name in self.tools:
@@ -134,17 +214,12 @@ class Agent:
         reset: bool = True,
         max_steps: int | None = None,
     ) -> Awaitable[str] | AsyncIterator[Event]:
-        """Run the agent on a task.
+        """Run the agent on a task within this session.
 
         With stream=False (the default) this returns an awaitable that resolves
-        to the final answer string:
-
-            answer = await agent.run(task)
-
-        With stream=True it returns an async iterator of Events instead:
-
-            async for event in agent.run(task, stream=True):
-                ...
+        to the final answer string. With stream=True it returns an async iterator
+        of Events. Pass reset=False to continue from this session's existing
+        memory (multi-turn).
         """
 
         events = self._run_stream(task, reset=reset, max_steps=max_steps)
@@ -174,7 +249,7 @@ class Agent:
 
         self.memory.add(TaskStep(task=task))
 
-        limit = self.max_steps if max_steps is None else max_steps
+        limit = self.agent.max_steps if max_steps is None else max_steps
 
         # Remember the previous step's calls so we can spot an exact repeat.
         previous_signature: tuple[tuple[str, str], ...] | None = None
@@ -186,12 +261,14 @@ class Agent:
                 return
 
             started = time.monotonic()
-            messages = self.memory.to_messages(self.instructions)
+            messages = self.memory.to_messages(self.agent.instructions)
 
             # Stream the model turn: emit text as it arrives, then rebuild the
             # full ChatMessage from the deltas for the rest of the step to use.
             deltas: list[Delta] = []
-            async for delta in self.model.stream(messages, tools=self._tool_schemas):
+            async for delta in self.agent.model.stream(
+                messages, tools=self._tool_schemas
+            ):
                 if delta.content:
                     yield TextDelta(text=delta.content)
                 deltas.append(delta)
@@ -216,7 +293,7 @@ class Agent:
             for tool_call in response.tool_calls:
                 yield ToolCallEvent(tool_call=tool_call)
 
-            if self.parallel_tools:
+            if self.agent.parallel_tools:
                 results: list[ToolResult] = await asyncio.gather(
                     *(self._execute_tool(tc) for tc in response.tool_calls)
                 )
@@ -252,7 +329,7 @@ class Agent:
                 return
 
         # Step limit reached: force one tool-free answer.
-        messages = self.memory.to_messages(self.instructions)
+        messages = self.memory.to_messages(self.agent.instructions)
         messages.append(
             ChatMessage(
                 role="user",
@@ -261,15 +338,13 @@ class Agent:
         )
 
         deltas = []
-
-        async for delta in self.model.stream(messages):
+        async for delta in self.agent.model.stream(messages):
             if delta.content:
                 yield TextDelta(text=delta.content)
             deltas.append(delta)
 
         response = agglomerate_deltas(deltas)
         self.memory.add(FinalStep(answer=response.content))
-
         yield FinalEvent(answer=response.content, usage=response.usage)
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
@@ -305,7 +380,7 @@ class Agent:
         )
 
     def _build_load_skill_tool(self) -> Tool:
-        """Build the built-in load_skill tool, bound to this agent's skills."""
+        """Build the built-in load_skill tool, bound to this session."""
 
         @tool
         def load_skill(name: str) -> str:
@@ -316,10 +391,10 @@ class Agent:
                     the system prompt.
             """
 
-            skill = self.skills.get(name)
+            skill = self.agent.skills.get(name)
             if skill is None:
                 raise ToolCallError(
-                    f"Unknown skill {name!r}. Available: {sorted(self.skills)}"
+                    f"Unknown skill {name!r}. Available: {sorted(self.agent.skills)}"
                 )
 
             loaded = skill.load_tools()
@@ -337,8 +412,9 @@ class Agent:
     def interrupt(self) -> None:
         """Request a graceful stop before the next step.
 
-        The current run pauses rather than crashing; resume it later with
-        run(..., reset=False), which continues from the steps already in memory.
+        The current run pauses rather than crashing; resume it later by calling
+        run(..., reset=False) on this same session, which continues from the
+        steps already in memory.
         """
 
         self._interrupt.set()
