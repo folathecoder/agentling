@@ -40,6 +40,9 @@ class Tool:
     name: str
     description: str
     parameters: JsonSchema
+    # Optional per-tool time budget in seconds. None means use the agent's
+    # tool_timeout default (which is itself None unless the caller sets it).
+    timeout: float | None = None
 
     async def forward(self, **kwargs: Any) -> Any:
         """Execute the tool implementation.

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -5,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from agentling.agent import Agent
+from agentling.agent import Agent, AgentSession
 from agentling.errors import ModelError
 from agentling.events import (
     FinalEvent,
@@ -94,6 +95,17 @@ def multiply(a: int, b: int) -> int:
         b: The second number.
     """
     return a * b
+
+
+@tool
+async def slow(seconds: float) -> str:
+    """Sleep for a while, then return.
+
+    Args:
+        seconds: How long to sleep.
+    """
+    await asyncio.sleep(seconds)
+    return "slept"
 
 
 _REVIEWER_SKILL = Skill(
@@ -631,3 +643,109 @@ async def test_persistently_malformed_output_raises_model_error() -> None:
 
     with pytest.raises(ModelError):
         await agent.run("do something")
+
+
+# --------------------------------------------------------------------------- #
+# Timeouts and cancellation
+# --------------------------------------------------------------------------- #
+async def test_tool_timeout_becomes_observation() -> None:
+    model = FakeModel([_tool_turn("c1", "slow", seconds=5), _assistant(content="done")])
+    agent = Agent(model=model, tools=[slow], tool_timeout=0.01)
+    session = agent.start()
+
+    assert await session.run("call slow") == "done"
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    assert action.tool_results[0].is_error is True
+    assert "ToolTimeoutError" in action.tool_results[0].content
+
+
+async def test_parallel_timeout_keeps_other_results() -> None:
+    model = FakeModel(
+        [
+            _assistant(
+                tool_calls=[
+                    ToolCall(id="c1", name="slow", arguments={"seconds": 5}),
+                    ToolCall(id="c2", name="add", arguments={"a": 2, "b": 3}),
+                ]
+            ),
+            _assistant(content="both handled"),
+        ]
+    )
+    agent = Agent(model=model, tools=[slow, add], tool_timeout=0.01)
+    session = agent.start()
+
+    assert await session.run("two tools") == "both handled"
+    action = session.memory.steps[1]
+    assert isinstance(action, ActionStep)
+    by_name = {result.name: result for result in action.tool_results}
+    assert by_name["slow"].is_error is True
+    assert by_name["add"].is_error is False
+    assert by_name["add"].content == "5"
+
+
+class _SlowStreamModel:
+    """A model whose stream stalls before producing anything."""
+
+    async def generate(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> ChatMessage:
+        raise NotImplementedError
+
+    async def stream(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> AsyncIterator[Delta]:
+        await asyncio.sleep(5)
+        yield Delta(content="too late")
+
+
+async def test_model_stream_timeout_raises_model_error() -> None:
+    agent = Agent(model=_SlowStreamModel(), model_timeout=0.01)
+
+    with pytest.raises(ModelError):
+        await agent.run("hi")
+
+
+async def test_cancellation_propagates_during_a_tool() -> None:
+    model = FakeModel([_tool_turn("c1", "slow", seconds=5), _assistant(content="done")])
+    agent = Agent(model=model, tools=[slow])  # no timeout: relies on cancellation
+
+    async def run_it() -> str:
+        return await agent.run("call slow")
+
+    task = asyncio.ensure_future(run_it())
+    await asyncio.sleep(0.02)  # let the run reach the slow tool
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+class _InterruptMidStreamModel:
+    """Interrupts its own session partway through streaming."""
+
+    def __init__(self) -> None:
+        self.session: AgentSession | None = None
+
+    async def generate(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> ChatMessage:
+        raise NotImplementedError
+
+    async def stream(
+        self, messages: Sequence[ChatMessage], tools: Sequence[Any] | None = None
+    ) -> AsyncIterator[Delta]:
+        yield Delta(content="par")
+        assert self.session is not None
+        self.session.interrupt()
+        yield Delta(content="tial")
+        yield Delta(usage=Usage(1, 1))
+
+
+async def test_interrupt_during_stream_stops_the_run() -> None:
+    model = _InterruptMidStreamModel()
+    agent = Agent(model=model)
+    session = agent.start()
+    model.session = session
+
+    assert await session.run("stream") == "Run interrupted."

@@ -28,7 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal, overload
 
-from .errors import ModelError, ModelOutputError
+from .errors import ModelError, ModelOutputError, ToolTimeoutError
 from .events import (
     Event,
     FinalEvent,
@@ -75,6 +75,8 @@ class Agent:
         max_steps: int = 15,
         step_callbacks: Sequence[Callable[[Step], None]] = (),
         parallel_tools: bool = True,
+        tool_timeout: float | None = None,
+        model_timeout: float | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1.")
@@ -82,6 +84,8 @@ class Agent:
         self.model = model
         self.max_steps = max_steps
         self.parallel_tools = parallel_tools
+        self.tool_timeout = tool_timeout
+        self.model_timeout = model_timeout
         # Default callbacks applied to every session. A session copies these and
         # may append its own.
         self.step_callbacks = list(step_callbacks)
@@ -275,13 +279,30 @@ class AgentSession:
 
             # Stream the model turn: emit text as it arrives, then rebuild the
             # full ChatMessage from the deltas for the rest of the step to use.
+            # model_timeout bounds a hung turn, and the per-chunk interrupt check
+            # lets a long stream be stopped without waiting for it to finish.
             deltas: list[Delta] = []
-            async for delta in self.agent.model.stream(
-                messages, tools=self._tool_schemas
-            ):
-                if delta.content:
-                    yield TextDelta(text=delta.content)
-                deltas.append(delta)
+            interrupted = False
+            try:
+                async with asyncio.timeout(self.agent.model_timeout):
+                    async for delta in self.agent.model.stream(
+                        messages, tools=self._tool_schemas
+                    ):
+                        if delta.content:
+                            yield TextDelta(text=delta.content)
+                        deltas.append(delta)
+                        if self._interrupt.is_set():
+                            interrupted = True
+                            break
+            except TimeoutError as exc:
+                raise ModelError(
+                    f"Model stream exceeded the {self.agent.model_timeout}s timeout."
+                ) from exc
+
+            if interrupted:
+                self._interrupt.clear()
+                yield FinalEvent(answer="Run interrupted.")
+                return
 
             # Malformed tool calls (bad JSON, missing name) are recoverable:
             # re-prompt the model with a correction, up to a small cap, rather
@@ -374,10 +395,16 @@ class AgentSession:
         )
 
         deltas = []
-        async for delta in self.agent.model.stream(messages):
-            if delta.content:
-                yield TextDelta(text=delta.content)
-            deltas.append(delta)
+        try:
+            async with asyncio.timeout(self.agent.model_timeout):
+                async for delta in self.agent.model.stream(messages):
+                    if delta.content:
+                        yield TextDelta(text=delta.content)
+                    deltas.append(delta)
+        except TimeoutError as exc:
+            raise ModelError(
+                f"Model stream exceeded the {self.agent.model_timeout}s timeout."
+            ) from exc
 
         try:
             response = agglomerate_deltas(deltas)
@@ -403,8 +430,26 @@ class AgentSession:
                 ),
                 is_error=True,
             )
+        # A per-tool timeout overrides the agent-wide default.
+        timeout = tool.timeout if tool.timeout is not None else self.agent.tool_timeout
         try:
-            output = await tool.call(tool_call.arguments)
+            if timeout is not None:
+                output = await asyncio.wait_for(tool.call(tool_call.arguments), timeout)
+            else:
+                output = await tool.call(tool_call.arguments)
+        except TimeoutError:
+            # A slow tool is an observation, not a crash. A genuine task
+            # cancellation raises CancelledError (a BaseException), which is
+            # deliberately not caught here so it propagates and stops the run.
+            err = ToolTimeoutError(
+                f"tool {tool_call.name!r} exceeded its {timeout}s timeout"
+            )
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                content=f"{type(err).__name__}: {err}",
+                is_error=True,
+            )
         except Exception as exc:
             # A failing tool becomes an observation the model can recover from
             # rather than a crash, so catching broadly here is intentional.
