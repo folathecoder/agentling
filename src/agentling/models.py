@@ -72,6 +72,13 @@ class Usage:
         """Total tokens consumed (input + output)."""
         return self.input_tokens + self.output_tokens
 
+    def __add__(self, other: Usage) -> Usage:
+        """Sum two usages field-wise (used to accumulate a run's total)."""
+        return Usage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+        )
+
 
 @dataclass
 class ChatMessage:

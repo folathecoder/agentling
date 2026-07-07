@@ -875,3 +875,29 @@ async def test_non_parallel_safe_tools_run_in_order() -> None:
     # first is not parallel_safe, so the step runs sequentially: it finishes
     # before second starts.
     assert order == ["first-start", "first-end", "second"]
+
+
+# --------------------------------------------------------------------------- #
+# Memory hardening: cumulative usage and the context-window hook
+# --------------------------------------------------------------------------- #
+async def test_final_event_reports_cumulative_usage() -> None:
+    model = FakeModel([_tool_turn("c1", "add", a=1, b=1), _assistant(content="2")])
+    agent = Agent(model=model, tools=[add])
+
+    events = [event async for event in agent.run("go", stream=True)]
+    final = events[-1]
+    assert isinstance(final, FinalEvent)
+    # Each FakeModel turn reports Usage(1, 1); two turns sum to Usage(2, 2).
+    assert final.usage == Usage(2, 2)
+
+
+async def test_context_manager_trims_the_prompt() -> None:
+    def keep_only_system(messages: list[ChatMessage]) -> list[ChatMessage]:
+        return messages[:1]
+
+    model = FakeModel([_assistant(content="ok")])
+    agent = Agent(model=model, context_manager=keep_only_system)
+
+    assert await agent.run("hello") == "ok"
+    # The model saw only the trimmed message list.
+    assert len(model.calls[0]) == 1

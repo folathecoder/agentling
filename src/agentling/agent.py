@@ -39,7 +39,15 @@ from .events import (
     ToolResultEvent,
 )
 from .memory import ActionStep, FinalStep, Memory, Step, TaskStep, ToolResult
-from .models import ChatMessage, Delta, Model, ToolCall, ToolSpec, agglomerate_deltas
+from .models import (
+    ChatMessage,
+    Delta,
+    Model,
+    ToolCall,
+    ToolSpec,
+    Usage,
+    agglomerate_deltas,
+)
 from .skills import Skill
 from .tools import FinalAnswerTool, Tool, ToolCallError, tool
 
@@ -82,6 +90,7 @@ class Agent:
         model_timeout: float | None = None,
         max_tool_output_chars: int | None = None,
         redact_errors: bool = False,
+        context_manager: Callable[[list[ChatMessage]], list[ChatMessage]] | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1.")
@@ -93,6 +102,10 @@ class Agent:
         self.model_timeout = model_timeout
         self.max_tool_output_chars = max_tool_output_chars
         self.redact_errors = redact_errors
+        # Optional hook to trim or summarize the prompt before each model call,
+        # so long runs do not blow the context window. It receives the full
+        # message list and returns the (possibly shorter) list to send.
+        self.context_manager = context_manager
         # Default callbacks applied to every session. A session copies these and
         # may append its own.
         self.step_callbacks = list(step_callbacks)
@@ -273,16 +286,19 @@ class AgentSession:
         # unparseable output, so it can retry. Cleared once a turn parses.
         correction_notes: list[ChatMessage] = []
         malformed_retries = 0
+        total_usage = Usage(0, 0)
 
         for _ in range(limit):
             if self._interrupt.is_set():
                 self._interrupt.clear()
-                yield FinalEvent(answer="Run interrupted.")
+                yield FinalEvent(answer="Run interrupted.", usage=total_usage)
                 return
 
             started = time.monotonic()
             messages = self.memory.to_messages(self.agent.instructions)
             messages.extend(correction_notes)
+            if self.agent.context_manager is not None:
+                messages = self.agent.context_manager(messages)
 
             # Stream the model turn: emit text as it arrives, then rebuild the
             # full ChatMessage from the deltas for the rest of the step to use.
@@ -308,7 +324,7 @@ class AgentSession:
 
             if interrupted:
                 self._interrupt.clear()
-                yield FinalEvent(answer="Run interrupted.")
+                yield FinalEvent(answer="Run interrupted.", usage=total_usage)
                 return
 
             # Malformed tool calls (bad JSON, missing name) are recoverable:
@@ -338,11 +354,13 @@ class AgentSession:
             # A well-formed turn clears any accumulated corrections.
             correction_notes.clear()
             malformed_retries = 0
+            if response.usage is not None:
+                total_usage = total_usage + response.usage
 
             # Forgiving termination: no tool calls means the content is the answer.
             if not response.tool_calls:
                 self.memory.add(FinalStep(answer=response.content))
-                yield FinalEvent(answer=response.content, usage=response.usage)
+                yield FinalEvent(answer=response.content, usage=total_usage)
                 return
 
             # Fingerprint this step's calls: (name, canonical JSON args) each.
@@ -396,7 +414,7 @@ class AgentSession:
             )
             if final is not None:
                 self.memory.add(FinalStep(answer=final.content))
-                yield FinalEvent(answer=final.content, usage=response.usage)
+                yield FinalEvent(answer=final.content, usage=total_usage)
                 return
 
         # Step limit reached: force one tool-free answer.
@@ -427,8 +445,10 @@ class AgentSession:
                 f"Model produced unparseable output on the forced final answer: {exc}"
             ) from exc
 
+        if response.usage is not None:
+            total_usage = total_usage + response.usage
         self.memory.add(FinalStep(answer=response.content))
-        yield FinalEvent(answer=response.content, usage=response.usage)
+        yield FinalEvent(answer=response.content, usage=total_usage)
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Run one tool call, turning any failure into an error observation."""
@@ -443,6 +463,7 @@ class AgentSession:
                     f"Available: {list(self.tools)}"
                 ),
                 is_error=True,
+                error_kind="unknown_tool",
             )
         # A per-tool timeout overrides the agent-wide default.
         timeout = tool.timeout if tool.timeout is not None else self.agent.tool_timeout
@@ -463,6 +484,7 @@ class AgentSession:
                 name=tool_call.name,
                 content=f"{type(err).__name__}: {err}",
                 is_error=True,
+                error_kind="timeout",
             )
         except ToolCallError as exc:
             # Invalid-argument errors are safe and useful, so the model always
@@ -472,6 +494,7 @@ class AgentSession:
                 name=tool_call.name,
                 content=f"{type(exc).__name__}: {exc}",
                 is_error=True,
+                error_kind="validation",
             )
         except Exception as exc:
             # An unexpected tool failure becomes an observation the model can
@@ -490,6 +513,7 @@ class AgentSession:
                 name=tool_call.name,
                 content=content,
                 is_error=True,
+                error_kind="execution",
             )
 
         content = str(output)
