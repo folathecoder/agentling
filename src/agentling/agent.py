@@ -375,7 +375,6 @@ class AgentSession:
             looping = signature == previous_signature
             previous_signature = signature
 
-            # Announce every call, then run them (concurrently or in order).
             for tool_call in response.tool_calls:
                 yield ToolCallEvent(tool_call=tool_call)
 
